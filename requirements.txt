@@ -1,0 +1,4 @@
+pylast==5.3.0
+fuzzywuzzy==0.18.0
+python-Levenshtein==0.21.1
+git+https://github.com/sigma67/ytmusicapi@0d39603
