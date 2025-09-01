@@ -189,6 +189,32 @@ def save_last_scrobbled(track_id):
         logger.error(f"Error saving legacy history file: {e}")
 
 
+def get_last_processed_track_id() -> str:
+    """Get the last processed track ID from legacy history file"""
+    try:
+        if HISTORY_FILE.exists():
+            with open(HISTORY_FILE, 'r', encoding='utf-8') as f:
+                track_id = f.read().strip()
+                if track_id:
+                    logger.info(f"Last processed track ID: {track_id}")
+                    return track_id
+        logger.info("No previous processing history found")
+        return None
+    except Exception as e:
+        logger.error(f"Error reading last processed track ID: {e}")
+        return None
+
+
+def save_last_processed_track_id(track_id: str):
+    """Save the most recent processed track ID (even if not successfully scrobbled)"""
+    try:
+        with open(HISTORY_FILE, 'w', encoding='utf-8') as f:
+            f.write(track_id)
+        logger.info(f"Updated last processed track ID: {track_id}")
+    except Exception as e:
+        logger.error(f"Error saving last processed track ID: {e}")
+
+
 def clean_youtube_metadata(text: str, is_artist: bool = False) -> str:
     """Clean YouTube Music specific metadata issues"""
     if not text:
@@ -672,33 +698,80 @@ def can_scrobble_track(track: Dict, proposed_timestamp: int, scrobble_history: D
     return True, f"Sufficient gap from {len(previous_timestamps)} previous scrobbles"
 
 
-def find_tracks_to_scrobble(ytmusic_history: List[Dict], scrobble_history: Dict[str, Dict]) -> List[Tuple[Dict, int]]:
-    """Find tracks that need to be scrobbled with their proposed timestamps"""
+def find_new_tracks_to_scrobble(ytmusic_history: List[Dict], scrobble_history: Dict[str, Dict], last_processed_track_id: str = None) -> List[Tuple[Dict, int]]:
+    """Find only NEW tracks that haven't been processed yet"""
     tracks_to_scrobble = []
     current_time = int(time.time())
+    new_tracks_found = False
     
-    logger.info(f"Checking YouTube Music history for tracks that can be scrobbled...")
+    logger.info(f"Checking for new tracks since last run...")
     
-    # Process tracks in reverse order (oldest first) and assign timestamps
-    for i, track in enumerate(reversed(ytmusic_history)):
+    # Find where we left off by looking for the last processed track
+    start_index = 0
+    if last_processed_track_id:
+        for i, track in enumerate(ytmusic_history):
+            if track['videoId'] == last_processed_track_id:
+                start_index = i + 1  # Start after the last processed track
+                logger.info(f"Resuming from track #{i+1}, found {start_index} new tracks to check")
+                break
+        else:
+            logger.info(f"Last processed track not found in current history, processing all {len(ytmusic_history)} tracks")
+    else:
+        logger.info(f"No previous processing history, checking all {len(ytmusic_history)} tracks")
+    
+    # Only process NEW tracks (from start_index forward)
+    new_tracks = ytmusic_history[start_index:]
+    if not new_tracks:
+        logger.info("No new tracks found since last run")
+        return []
+    
+    logger.info(f"Found {len(new_tracks)} new tracks to process")
+    
+    # Process new tracks in reverse order (oldest first) with realistic timestamps
+    for i, track in enumerate(reversed(new_tracks)):
         track_id = track['videoId']
         artist = track['artists'][0]['name']
         title = track['title']
         
-        # Calculate proposed timestamp (spaced 2 minutes apart, working backwards from current time)
-        proposed_timestamp = current_time - (len(ytmusic_history) - i - 1) * 120
+        # Create realistic timestamp: track duration + 30s buffer minimum, working backwards
+        track_duration = get_track_duration_seconds(track)
+        track_spacing = max(track_duration + 30, 180)  # At least 3 minutes between any tracks
         
-        # Check if this track can be scrobbled at the proposed time
-        can_scrobble, reason = can_scrobble_track(track, proposed_timestamp, scrobble_history)
+        # Calculate cumulative time going backwards
+        minutes_back = (len(new_tracks) - i - 1) * (track_spacing // 60)
+        proposed_timestamp = current_time - (minutes_back * 60)
+        
+        # Check if this track was already scrobbled recently (within last 24 hours)
+        can_scrobble, reason = can_scrobble_track_simple(track, proposed_timestamp, scrobble_history)
         
         if can_scrobble:
             tracks_to_scrobble.append((track, proposed_timestamp))
-            logger.info(f"✅ {artist} - {title}: {reason}")
+            logger.info(f"✅ NEW: {artist} - {title}: {reason}")
         else:
-            logger.info(f"⏭️  {artist} - {title}: {reason}")
+            logger.info(f"⏭️  SKIP: {artist} - {title}: {reason}")
     
-    logger.info(f"Found {len(tracks_to_scrobble)} tracks that can be scrobbled")
+    logger.info(f"Found {len(tracks_to_scrobble)} new tracks ready to scrobble")
     return tracks_to_scrobble
+
+
+def can_scrobble_track_simple(track: Dict, proposed_timestamp: int, scrobble_history: Dict[str, Dict]) -> Tuple[bool, str]:
+    """Smart duplicate checking - prevent scrobbling same track too close based on track length"""
+    track_id = track['videoId']
+    track_duration = get_track_duration_seconds(track)
+    
+    # Minimum gap: track duration + 30 seconds (allows for loops/repeats)
+    min_gap_seconds = track_duration + 30
+    cutoff_time = proposed_timestamp - min_gap_seconds
+    
+    if track_id in scrobble_history:
+        for timestamp_str in scrobble_history[track_id]:
+            timestamp = int(timestamp_str)
+            if timestamp > cutoff_time:
+                minutes_ago = (proposed_timestamp - timestamp) // 60
+                min_gap_minutes = min_gap_seconds // 60
+                return False, f"Already scrobbled {minutes_ago}m ago (need {min_gap_minutes}m gap for this track)"
+    
+    return True, "Track ready to scrobble"
 
 
 def main():
@@ -741,8 +814,11 @@ def main():
         logger.info(f"Saved cleaned history with {len(cleaned_history)} entries")
     scrobble_history = cleaned_history
     
-    # Find tracks that need to be scrobbled with their proposed timestamps
-    tracks_to_scrobble = find_tracks_to_scrobble(ytmusic_history, scrobble_history)
+    # Get the last processed track ID to avoid reprocessing
+    last_processed_track_id = get_last_processed_track_id()
+    
+    # Find only NEW tracks that need to be scrobbled
+    tracks_to_scrobble = find_new_tracks_to_scrobble(ytmusic_history, scrobble_history, last_processed_track_id)
     
     if not tracks_to_scrobble:
         logger.info("No new tracks to scrobble")
@@ -767,6 +843,10 @@ def main():
             most_recent_track_id = track_id
         else:
             logger.error(f"Failed to scrobble: {artist} - {title}")
+        
+        # Always update the last processed track ID (even if scrobble failed)
+        # This prevents reprocessing the same tracks over and over
+        save_last_processed_track_id(track_id)
         
         # Small delay between scrobbles to avoid rate limiting
         if i < len(tracks_to_scrobble) - 1:
