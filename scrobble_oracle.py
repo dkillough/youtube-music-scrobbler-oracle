@@ -393,8 +393,17 @@ def search_lastfm_tracks(network: pylast.LastFMNetwork, artist: str, title: str,
         
         for track in results.get_next_page()[:limit]:
             try:
-                track_artist = normalize_text(track.get_artist().get_name(), is_artist=True)
-                track_title = normalize_text(track.get_name(), is_artist=False)
+                artist_obj = track.get_artist()
+                artist_name = artist_obj.get_name() if artist_obj else ""
+                track_name = track.get_name() if track.get_name() else ""
+                
+                # Skip if we can't get basic track info
+                if not artist_name or not track_name:
+                    logger.warning(f"Skipping track with missing artist or title info")
+                    continue
+                
+                track_artist = normalize_text(artist_name, is_artist=True)
+                track_title = normalize_text(track_name, is_artist=False)
                 track_string = f"{track_artist} {track_title}"
                 
                 # Calculate similarity score
@@ -464,9 +473,14 @@ def find_best_track_match(network: pylast.LastFMNetwork, artist: str, title: str
             popularity = get_track_popularity(track)
             candidates_with_popularity.append((track, similarity_score, popularity))
             
-            artist_name = track.get_artist().get_name()
-            track_name = track.get_name()
-            logger.info(f"Candidate: {artist_name} - {track_name} (similarity: {similarity_score}, listeners: {popularity})")
+            try:
+                artist_obj = track.get_artist()
+                artist_name = artist_obj.get_name() if artist_obj else "Unknown Artist"
+                track_name = track.get_name() if track.get_name() else "Unknown Track"
+                logger.info(f"Candidate: {artist_name} - {track_name} (similarity: {similarity_score}, listeners: {popularity})")
+            except Exception as track_info_error:
+                logger.warning(f"Error getting track info for candidate: {track_info_error}")
+                continue
             
         except Exception as e:
             logger.warning(f"Error getting popularity for track: {e}")
@@ -495,10 +509,14 @@ def find_best_track_match(network: pylast.LastFMNetwork, artist: str, title: str
             best_track = track
     
     if best_track:
-        artist_name = best_track.get_artist().get_name()
-        track_name = best_track.get_name()
-        popularity = next(pop for t, _, pop in candidates_with_popularity if t == best_track)
-        logger.info(f"Selected best match: {artist_name} - {track_name} (weighted score: {best_weighted_score:.1f}, listeners: {popularity})")
+        try:
+            artist_obj = best_track.get_artist()
+            artist_name = artist_obj.get_name() if artist_obj else "Unknown Artist"
+            track_name = best_track.get_name() if best_track.get_name() else "Unknown Track"
+            popularity = next(pop for t, _, pop in candidates_with_popularity if t == best_track)
+            logger.info(f"Selected best match: {artist_name} - {track_name} (weighted score: {best_weighted_score:.1f}, listeners: {popularity})")
+        except Exception as e:
+            logger.warning(f"Error getting best match details: {e}")
     
     return best_track
 
@@ -524,14 +542,19 @@ def scrobble_track(network, track, custom_timestamp: Optional[int] = None) -> bo
         )
         
         if best_track:
-            # Use the matched track's details
-            matched_artist = best_track.get_artist().get_name()
-            matched_title = best_track.get_name()
-            
-            # Try to get album from the matched track, fallback to cleaned album
+            # Use the matched track's details with null safety
             try:
-                matched_album = best_track.get_album().get_name() if best_track.get_album() else cleaned_album
-            except:
+                artist_obj = best_track.get_artist()
+                matched_artist = artist_obj.get_name() if artist_obj else cleaned_artist
+                matched_title = best_track.get_name() if best_track.get_name() else cleaned_title
+                
+                # Try to get album from the matched track, fallback to cleaned album
+                album_obj = best_track.get_album()
+                matched_album = album_obj.get_name() if album_obj else cleaned_album
+            except Exception as e:
+                logger.warning(f"Error extracting track details from Last.fm match: {e}")
+                matched_artist = cleaned_artist
+                matched_title = cleaned_title
                 matched_album = cleaned_album
             
             logger.info(f"Scrobbling matched track: {matched_artist} - {matched_title}")

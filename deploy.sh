@@ -3,7 +3,14 @@
 
 set -e
 
+# Get the directory containing this script
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+# If we're running from parent directory, adjust to oracle subdirectory
+if [[ "$(basename "$SCRIPT_DIR")" != "oracle" && -d "$SCRIPT_DIR/oracle" ]]; then
+    SCRIPT_DIR="$SCRIPT_DIR/oracle"
+    echo "ℹ️  Detected running from parent directory, using oracle subdirectory"
+fi
 SERVICE_DIR="/opt/ytmusic-scrobbler"
 SERVICE_USER="ytmusic"
 
@@ -22,7 +29,23 @@ if command -v apt-get &> /dev/null; then
     apt-get install -y python3 python3-pip python3-venv git cron
 elif command -v yum &> /dev/null; then
     yum update -y
+    # Oracle Linux / RHEL / CentOS package names
     yum install -y python3 python3-pip git cronie
+    # Ensure venv module is available (usually included with python3)
+    if ! python3 -c "import venv" 2>/dev/null; then
+        echo "⚠️  Installing additional Python development tools..."
+        yum install -y python3-devel
+    fi
+    systemctl enable crond
+    systemctl start crond
+elif command -v dnf &> /dev/null; then
+    dnf update -y
+    # Fedora / newer RHEL systems
+    dnf install -y python3 python3-pip git cronie
+    if ! python3 -c "import venv" 2>/dev/null; then
+        echo "⚠️  Installing additional Python development tools..."
+        dnf install -y python3-devel
+    fi
     systemctl enable crond
     systemctl start crond
 else
@@ -46,14 +69,16 @@ chown "$SERVICE_USER:$SERVICE_USER" "$SERVICE_DIR"
 
 # Copy files as service user
 echo "📋 Copying application files..."
-sudo -u "$SERVICE_USER" cp "$SCRIPT_DIR/scrobble_oracle.py" "$SERVICE_DIR/"
-sudo -u "$SERVICE_USER" cp "$SCRIPT_DIR/setup_credentials.py" "$SERVICE_DIR/"
-sudo -u "$SERVICE_USER" cp "$SCRIPT_DIR/requirements.txt" "$SERVICE_DIR/"
-sudo -u "$SERVICE_USER" cp "$SCRIPT_DIR/.env.example" "$SERVICE_DIR/"
+sudo -u "$SERVICE_USER" cp "./scrobble_oracle.py" "$SERVICE_DIR/"
+sudo -u "$SERVICE_USER" cp "./setup_credentials.py" "$SERVICE_DIR/"
+sudo -u "$SERVICE_USER" cp "./history_manager.py" "$SERVICE_DIR/" 2>/dev/null || echo "ℹ️  history_manager.py not found, skipping"
+sudo -u "$SERVICE_USER" cp "./requirements.txt" "$SERVICE_DIR/"
+sudo -u "$SERVICE_USER" cp "./.env.example" "$SERVICE_DIR/"
 
 # Make scripts executable
 chmod +x "$SERVICE_DIR/scrobble_oracle.py"
 chmod +x "$SERVICE_DIR/setup_credentials.py"
+[ -f "$SERVICE_DIR/history_manager.py" ] && chmod +x "$SERVICE_DIR/history_manager.py"
 
 # Set up Python virtual environment
 echo "🐍 Setting up Python virtual environment..."
@@ -76,7 +101,7 @@ echo ""
 echo "📋 Next steps:"
 echo "1. Edit the environment file: sudo -u $SERVICE_USER nano $SERVICE_DIR/.env"
 echo "2. Set up YouTube Music credentials: sudo -u $SERVICE_USER $SERVICE_DIR/venv/bin/python3 $SERVICE_DIR/setup_credentials.py"
-echo "3. Set up cron job: bash $SCRIPT_DIR/setup_cron.sh [interval_minutes]"
+echo "3. Set up cron job: bash ./setup_cron.sh [interval_minutes]"
 echo ""
 echo "📁 Service installed in: $SERVICE_DIR"
 echo "👤 Running as user: $SERVICE_USER"
