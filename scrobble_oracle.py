@@ -302,6 +302,65 @@ def save_last_processed_track_id(track_id: str):
         logger.error(f"Error saving last processed track ID: {e}")
 
 
+def safe_get_artist_name(track: Dict) -> str:
+    """Safely extract artist name from YouTube Music track with null safety"""
+    try:
+        if not track:
+            return "Unknown Artist"
+
+        artists = track.get('artists')
+        if not artists or not isinstance(artists, list) or len(artists) == 0:
+            return "Unknown Artist"
+
+        artist_obj = artists[0]
+        if not artist_obj or not isinstance(artist_obj, dict):
+            return "Unknown Artist"
+
+        artist_name = artist_obj.get('name', 'Unknown Artist')
+        return artist_name if artist_name else "Unknown Artist"
+
+    except Exception as e:
+        logger.warning(f"Error extracting artist name: {e}")
+        return "Unknown Artist"
+
+
+def safe_get_title(track: Dict) -> str:
+    """Safely extract title from YouTube Music track with null safety"""
+    try:
+        if not track:
+            return "Unknown Title"
+
+        title = track.get('title', 'Unknown Title')
+        return title if title else "Unknown Title"
+
+    except Exception as e:
+        logger.warning(f"Error extracting title: {e}")
+        return "Unknown Title"
+
+
+def safe_get_album_name(track: Dict) -> str:
+    """Safely extract album name from YouTube Music track with null safety"""
+    try:
+        if not track:
+            return ""
+
+        album = track.get('album')
+        if not album:
+            return ""
+
+        # Handle case where album is not a dict
+        if not isinstance(album, dict):
+            logger.warning(f"Album is not a dict, got: {type(album)}")
+            return ""
+
+        album_name = album.get('name', '')
+        return album_name if album_name else ""
+
+    except Exception as e:
+        logger.warning(f"Error extracting album name: {e}")
+        return ""
+
+
 def clean_youtube_metadata(text: str, is_artist: bool = False) -> str:
     """Clean YouTube Music specific metadata issues"""
     if not text:
@@ -637,10 +696,10 @@ def find_best_track_match(network: pylast.LastFMNetwork, artist: str, title: str
 def scrobble_track(network, track, custom_timestamp: Optional[int] = None) -> bool:
     """Scrobble a single track to Last.fm with enhanced metadata cleanup and fuzzy matching"""
     try:
-        # Extract original metadata
-        original_artist = track['artists'][0]['name']
-        original_title = track['title']
-        original_album = track.get('album', {}).get('name', '')
+        # Extract original metadata with safe null checks
+        original_artist = safe_get_artist_name(track)
+        original_title = safe_get_title(track)
+        original_album = safe_get_album_name(track)
         timestamp = custom_timestamp or int(time.time())
         
         # Clean metadata for better matching
@@ -729,9 +788,9 @@ def add_to_scrobble_history(track: Dict, timestamp: int, source: str = "ytmusic_
     duration_seconds = get_track_duration_seconds(track)
 
     track_data = {
-        'artist': track['artists'][0]['name'],
-        'title': track['title'],
-        'album': track.get('album', {}).get('name', ''),
+        'artist': safe_get_artist_name(track),
+        'title': safe_get_title(track),
+        'album': safe_get_album_name(track),
         'scrobbled_at': timestamp,
         'duration_seconds': duration_seconds,
         'source': source,  # Track source: "ytmusic_bot" or "mobile_extension"
@@ -741,16 +800,22 @@ def add_to_scrobble_history(track: Dict, timestamp: int, source: str = "ytmusic_
     # Load existing history
     history = load_scrobble_history()
 
-    # Create a unique key for this scrobble using date instead of timestamp
-    # This prevents duplicates when bot runs multiple times per day
-    # YouTube Music only provides "Today" anyway, so date-based is appropriate
-    scrobble_date = date.fromtimestamp(timestamp).isoformat()  # e.g., "2025-10-20"
-    scrobble_key = f"{track_id}_{scrobble_date}"
+    # Create a unique key for this scrobble using date + counter
+    # This allows multiple scrobbles per day while preventing duplicates from multiple cron runs
+    scrobble_date = date.fromtimestamp(timestamp).isoformat()  # e.g., "2025-12-20"
 
-    # Check if already scrobbled today
-    if scrobble_key in history:
-        logger.info(f"Track {track_id} already scrobbled today ({scrobble_date}), skipping duplicate")
-        return
+    # Count how many times this track was already scrobbled today
+    today_count = 0
+    prefix = f"{track_id}_{scrobble_date}"
+    for key in history.keys():
+        if key.startswith(prefix):
+            today_count += 1
+
+    # Generate new counter (1-indexed)
+    counter = today_count + 1
+    scrobble_key = f"{track_id}_{scrobble_date}_{counter}"
+
+    logger.info(f"Recording scrobble #{counter} for track {track_id} on {scrobble_date}")
 
     # Add new track with unique key
     history[scrobble_key] = track_data
@@ -764,7 +829,8 @@ def get_track_scrobble_timestamps(track_id: str, scrobble_history: Dict[str, Dic
     """Get all timestamps when a specific track was scrobbled"""
     timestamps = []
     for scrobble_key, scrobble_data in scrobble_history.items():
-        # Extract track_id from scrobble_key (format: track_id_timestamp)
+        # Extract track_id from scrobble_key
+        # Supports both old (track_id_date) and new (track_id_date_counter) formats
         if scrobble_key.startswith(f"{track_id}_"):
             timestamps.append(scrobble_data['scrobbled_at'])
     return sorted(timestamps)
@@ -826,8 +892,8 @@ def find_new_tracks_to_scrobble(ytmusic_history: List[Dict], scrobble_history: D
     # Process new tracks in reverse order (oldest first) with realistic timestamps
     for i, track in enumerate(reversed(new_tracks)):
         track_id = track['videoId']
-        artist = track['artists'][0]['name']
-        title = track['title']
+        artist = safe_get_artist_name(track)
+        title = safe_get_title(track)
         
         # Create realistic timestamp: track duration + 30s buffer minimum, working backwards
         track_duration = get_track_duration_seconds(track)
@@ -923,9 +989,9 @@ def is_track_in_lastfm_recent(track: Dict, lastfm_scrobbles: Dict[str, List[int]
     if not lastfm_scrobbles:
         return False, None
 
-    # Normalize track metadata
-    original_artist = track['artists'][0]['name']
-    original_title = track['title']
+    # Normalize track metadata with safe extraction
+    original_artist = safe_get_artist_name(track)
+    original_title = safe_get_title(track)
 
     # Clean and normalize for matching
     cleaned_artist, cleaned_title, _ = clean_track_metadata(original_artist, original_title, "")
@@ -959,10 +1025,13 @@ def process_today_tracks_with_gap_detection(
     logger.info(f"Processing {len(today_tracks)} tracks from 'Today' with mobile gap detection...")
     logger.info("="*60)
 
+    # Track pending scrobbles in this run to avoid duplicates
+    pending_scrobbles_count = {}
+
     for i, track in enumerate(reversed(today_tracks)):  # Process oldest to newest
         track_id = track['videoId']
-        artist = track['artists'][0]['name']
-        title = track['title']
+        artist = safe_get_artist_name(track)
+        title = safe_get_title(track)
         duration = get_track_duration_seconds(track)
 
         # Estimate timestamp working backwards from current time
@@ -983,18 +1052,30 @@ def process_today_tracks_with_gap_detection(
             logger.info(f"    └─ Found on Last.fm (~{time_diff_minutes}m difference), skipping (mobile scrobble)")
             continue
 
-        # Check against local bot history using date-based key
-        # This prevents duplicates across multiple runs on the same day
-        scrobble_date = date.today().isoformat()  # e.g., "2025-10-20"
-        scrobble_key = f"{track_id}_{scrobble_date}"
+        # Check against local bot history using counter-based approach
+        # Count how many times this track appears in YouTube history vs our scrobble history
+        scrobble_date = date.today().isoformat()  # e.g., "2025-12-20"
 
-        if scrobble_key in scrobble_history:
+        # Count occurrences in YouTube Music history (today_tracks)
+        youtube_count = sum(1 for t in today_tracks if t.get('videoId') == track_id)
+
+        # Count how many times already scrobbled today in our history
+        prefix = f"{track_id}_{scrobble_date}"
+        already_scrobbled_count = sum(1 for key in scrobble_history.keys() if key.startswith(prefix))
+
+        # Add pending scrobbles from current run
+        current_pending = pending_scrobbles_count.get(track_id, 0)
+        total_scrobbled = already_scrobbled_count + current_pending
+
+        # Skip if we've already scrobbled (or are about to scrobble) all occurrences
+        if total_scrobbled >= youtube_count:
             logger.info(f"  ✓ {artist} - {title}")
-            logger.info(f"    └─ Already scrobbled today, skipping")
+            logger.info(f"    └─ Already scrobbled/queued {youtube_count} occurrence(s) today, skipping")
             continue
 
         # Track is clear to scrobble!
         tracks_to_scrobble.append((track, estimated_timestamp))
+        pending_scrobbles_count[track_id] = current_pending + 1
         timestamp_str = datetime.datetime.fromtimestamp(estimated_timestamp).strftime('%H:%M:%S')
         logger.info(f"  → {artist} - {title}")
         logger.info(f"    └─ Will scrobble at {timestamp_str} (estimated)")
@@ -1081,6 +1162,16 @@ def main():
         logger.info("No new tracks to scrobble (all tracks either on Last.fm or in bot history)")
         return
 
+    # Fix track-timestamp pairing
+    # The tracks were processed oldest-to-newest with timestamps calculated backwards from current_time
+    # This created wrong pairing: oldest track → newest timestamp (backwards!)
+    # Fix: reverse only the tracks list, keep timestamps same, then re-pair
+    tracks_only = [track for track, _ in tracks_to_scrobble]
+    timestamps_only = [ts for _, ts in tracks_to_scrobble]
+    tracks_only.reverse()  # Now: [newest, middle, oldest]
+    tracks_to_scrobble = list(zip(tracks_only, timestamps_only))
+    logger.info("Fixed timestamp pairing (oldest track → oldest timestamp, newest track → newest timestamp)")
+
     # Summary before scrobbling
     logger.info("")
     logger.info(f"📊 Summary: Will scrobble {len(tracks_to_scrobble)} tracks")
@@ -1093,8 +1184,8 @@ def main():
 
     for i, (track, timestamp) in enumerate(tracks_to_scrobble):
         track_id = track['videoId']
-        artist = track['artists'][0]['name']
-        title = track['title']
+        artist = safe_get_artist_name(track)
+        title = safe_get_title(track)
 
         timestamp_str = datetime.datetime.fromtimestamp(timestamp).strftime('%Y-%m-%d %H:%M:%S')
 

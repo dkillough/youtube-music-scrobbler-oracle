@@ -1,5 +1,6 @@
 # Environment variables (contains sensitive API keys)
 .env
+config/
 
 # Python
 __pycache__/
