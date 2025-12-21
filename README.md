@@ -5,15 +5,18 @@ This is a converted version of the YTMusic Scrobbler that runs as a periodic scr
 ## Features
 
 - 🎵 Scrobbles YouTube Music listening history to Last.fm
-- 🔄 Runs periodically via cron (configurable interval)
+- 📱 **Mobile Gap-Filling**: Automatically detects and skips tracks already scrobbled from mobile extensions
+- 🔄 Runs periodically via cron (recommended: every 2-3 hours)
 - 📊 Comprehensive logging and history tracking
 - 🛡️ Error handling and credential management
-- 🏗️ Easy deployment on Oracle Cloud
-- 🗂️ Duplicate prevention with 2-week lookback
+- 🏗️ Easy deployment on Oracle Cloud (Oracle Linux optimized)
+- 🗂️ Smart duplicate prevention with duration-based gaps
 - 📈 History management utilities
-- ⏰ Intelligent timestamp handling for batch scrobbles
+- ⏰ Intelligent timestamp estimation for "Today" tracks
 - 🔍 Fuzzy matching for accurate Last.fm track matching
 - 📈 Popularity-based track selection (prefers tracks with more listeners)
+- 🧪 Dry-run mode for testing without actual scrobbling
+- 🔁 Automatic 2-week history cleanup to prevent storage bloat
 
 ## Prerequisites
 
@@ -42,12 +45,19 @@ sudo bash deploy.sh
 sudo -u ytmusic nano /opt/ytmusic-scrobbler/.env
 ```
 
-Add your Last.fm credentials:
+Add your Last.fm credentials and configure mobile gap-filling:
 ```env
+# Last.fm API Credentials
 LASTFM_API_KEY=your_api_key_here
 LASTFM_API_SECRET=your_api_secret_here
 LASTFM_USERNAME=your_username
 LASTFM_PASSWORD=your_password
+
+# Mobile Gap-Filling Configuration (optional - defaults shown)
+RECENT_WINDOW_HOURS=2          # Check Last.fm for scrobbles from last N hours
+MAX_SCROBBLES_PER_RUN=20       # Rate limit protection
+ENABLE_MOBILE_DETECTION=true   # Skip tracks already on Last.fm
+DRY_RUN=false                  # Set true for testing
 ```
 
 ### 3. Set Up YouTube Music Credentials
@@ -59,15 +69,20 @@ sudo -u ytmusic /opt/ytmusic-scrobbler/venv/bin/python3 /opt/ytmusic-scrobbler/s
 
 Follow the instructions to copy your browser headers from YouTube Music.
 
-### 4. Set Up Periodic Execution
+### 4. Test with Dry Run
 
 ```bash
-# Set up cron job to run every 5 minutes
-sudo bash setup_cron.sh 5
+# Test what would be scrobbled without actually scrobbling
+sudo -u ytmusic /opt/ytmusic-scrobbler/venv/bin/python3 /opt/ytmusic-scrobbler/scrobble_oracle.py --dry-run
+```
 
-# Or choose a different interval (in minutes)
-sudo bash setup_cron.sh 10  # Every 10 minutes
-sudo bash setup_cron.sh 60  # Every hour
+### 5. Set Up Periodic Execution
+
+```bash
+# Recommended: Run every 2-3 hours for mobile gap-filling
+sudo bash setup_cron.sh 120  # Every 2 hours (recommended)
+sudo bash setup_cron.sh 180  # Every 3 hours
+sudo bash setup_cron.sh 240  # Every 4 hours
 ```
 
 ## File Structure
@@ -138,7 +153,10 @@ sudo -u ytmusic crontab -e
 
 ### Manual Test Run
 ```bash
-# Test the script manually
+# Test with dry run (see what would be scrobbled without actually scrobbling)
+sudo -u ytmusic /opt/ytmusic-scrobbler/venv/bin/python3 /opt/ytmusic-scrobbler/scrobble_oracle.py --dry-run
+
+# Run the script manually (actually scrobble)
 sudo -u ytmusic /opt/ytmusic-scrobbler/venv/bin/python3 /opt/ytmusic-scrobbler/scrobble_oracle.py
 ```
 
@@ -162,30 +180,34 @@ sudo -u ytmusic /opt/ytmusic-scrobbler/venv/bin/python3 /opt/ytmusic-scrobbler/s
 
 ## How It Works
 
+### Mobile Gap-Filling (New!)
+- **Cross-references Last.fm**: Fetches your recent scrobbles (last 2 hours by default)
+- **Smart detection**: Automatically skips tracks already scrobbled from mobile extensions
+- **Fills the gaps**: Only scrobbles tracks missing from Last.fm (mobile-only listening)
+- **Configurable window**: Adjust `RECENT_WINDOW_HOURS` for your needs
+- **Rate-limit safe**: Max 21 API calls per run (1 getRecentTracks + up to 20 scrobbles)
+
+### YouTube Music "Today" Processing
+- **Limitation**: YouTube Music API only provides relative dates ("Today", "Yesterday")
+- **Focus on Today**: Only processes tracks from "Today" section for accuracy
+- **Timestamp estimation**: Works backwards from current time using track durations
+- **Realistic spacing**: Each track gets duration + 30s buffer spacing
+- **24-hour limit**: Won't go back more than 24 hours to maintain accuracy
+
 ### Smart Duplicate Prevention with Automatic Cleanup
 - Maintains a comprehensive JSON history file (`scrobble_history.json`)
-- Tracks all scrobbled tracks with timestamps, duration, and metadata
-- Allows same track multiple times per day if sufficient time gap exists
+- Tracks all scrobbled tracks with timestamps, duration, source, and metadata
+- **Source tracking**: Distinguishes between bot scrobbles and detected mobile scrobbles
 - **Time gap requirement**: Track duration + 30 seconds buffer
 - **Perfect for repeated listening**: Supports tracks on loop/repeat
 - **🗑️ Automatic cleanup**: Removes entries older than 2 weeks on every run
 - **💾 Storage leak prevention**: Prevents unlimited history file growth
-- **⚡ Efficient**: Only saves when cleanup actually removes entries
 - Prevents duplicate scrobbles even across service restarts
-
-### Two-Week Lookback with Smart Timing
-- Scans all tracks in YouTube Music history from past 2 weeks
-- **Duration-aware duplicate checking**: Each track can be scrobbled multiple times if:
-  - Time gap > track duration + 30 seconds
-  - Supports natural listening patterns (replaying favorites, loop mode)
-- Batch scrobbles valid tracks with appropriate timestamps
-- Maintains chronological order for better Last.fm history
-- Handles rate limiting between scrobbles (2-minute spacing)
 
 ### Smart Timestamps & Duration Tracking
 - Extracts track duration from YouTube Music API
-- Recent tracks get current timestamps
-- Batch scrobbles use spaced timestamps (2 minutes apart)
+- Estimates timestamps based on track position in "Today" section
+- Batch scrobbles use duration-aware spacing (not fixed intervals)
 - **Intelligent gap calculation**: Prevents scrobbling same track within (duration + 30s)
 - Preserves listening order in Last.fm history
 - Supports realistic listening patterns (allowing repeats after full plays)
@@ -210,10 +232,43 @@ sudo -u ytmusic /opt/ytmusic-scrobbler/venv/bin/python3 /opt/ytmusic-scrobbler/s
 | Monitoring | Container logs | System logs + files |
 | Resource Usage | Always running | Only runs when needed |
 | History Tracking | Simple last track ID | Comprehensive JSON history |
-| Duplicate Prevention | Basic | Smart duration-based with 2-week lookback |
-| Batch Processing | Single track per run | Multiple tracks per run with gap validation |
+| Duplicate Prevention | Basic | Smart duration-based + mobile detection |
+| Mobile Detection | None | Cross-references Last.fm to avoid duplicates |
+| Batch Processing | Single track per run | Multiple "Today" tracks per run |
 | Track Matching | Exact match only | Fuzzy matching with popularity weighting |
+| Timestamp Handling | Basic | Intelligent estimation based on track order |
 | Repeat Handling | Blocks all duplicates | Allows repeats after track duration + buffer |
+| Dry Run Mode | None | Full dry-run support for testing |
+
+## Known Limitations
+
+### YouTube Music API Constraints
+- **No exact timestamps**: YouTube Music only provides relative dates ("Today", "Yesterday")
+- **Today only**: Bot only processes tracks from "Today" section for accuracy
+- **Estimation required**: Timestamps are estimated based on track order and durations
+- **24-hour window**: Won't process tracks older than 24 hours
+
+### Mobile Detection
+- **Recent window only**: Only checks Last.fm for scrobbles from last N hours (default: 2)
+- **Not perfect**: If mobile extension delays scrobbling, bot may create duplicate
+- **Solution**: Run bot every 2-3 hours to minimize overlap
+- **Can be disabled**: Set `ENABLE_MOBILE_DETECTION=false` if causing issues
+
+### Loop Detection
+- **Limited to Today**: Can only detect loops within "Today" section
+- **Order-based**: Relies on track appearing multiple times in history
+- **Best effort**: YouTube Music may not always show all loop iterations
+
+### Rate Limiting
+- **Max tracks per run**: Default 20 tracks to avoid rate limiting
+- **2-second delays**: Between scrobbles to be respectful to Last.fm API
+- **Periodic execution**: Running every 2-3 hours is safe and recommended
+
+### General Notes
+- Bot won't catch up on old history (>24 hours ago)
+- First run may miss some tracks - this is expected
+- Mobile extensions should remain your primary scrobbling method
+- This bot is designed to **fill gaps**, not replace mobile scrobbling
 
 ## Security Notes
 

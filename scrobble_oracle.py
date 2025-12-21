@@ -6,6 +6,7 @@ Runs as a periodic script instead of continuous Docker container
 import time
 import os
 import datetime
+from datetime import date
 import logging
 import sys
 import json
@@ -48,6 +49,16 @@ if not all([LASTFM_API_KEY, LASTFM_API_SECRET, LASTFM_USERNAME, LASTFM_PASSWORD]
     print("ERROR: Missing required Last.fm environment variables:")
     print("Please set: LASTFM_API_KEY, LASTFM_API_SECRET, LASTFM_USERNAME, LASTFM_PASSWORD")
     sys.exit(1)
+
+# Mobile gap-filling configuration
+RECENT_WINDOW_HOURS = int(os.environ.get('RECENT_WINDOW_HOURS', '2'))
+MAX_SCROBBLES_PER_RUN = int(os.environ.get('MAX_SCROBBLES_PER_RUN', '20'))
+ENABLE_MOBILE_DETECTION = os.environ.get('ENABLE_MOBILE_DETECTION', 'true').lower() == 'true'
+DRY_RUN = os.environ.get('DRY_RUN', 'false').lower() == 'true'
+
+# Check for --dry-run command line argument
+if len(sys.argv) > 1 and sys.argv[1] == '--dry-run':
+    DRY_RUN = True
 
 # File paths
 BROWSER_CONFIG = CONFIG_DIR / "browser.json"
@@ -104,17 +115,90 @@ def get_listening_history(ytmusic):
         else:
             logger.warning("No history retrieved")
             return []
-            
+
     except ytmusicapi.exceptions.YTMusicServerError as e:
         logger.error(f"Failed to get history: {e}")
         # Mark credentials as errored
         if BROWSER_CONFIG.exists():
             BROWSER_CONFIG.rename(ERROR_CREDS_FILE)
         return None
-        
+
     except Exception as e:
         logger.error(f"Unexpected error getting history: {e}")
         return None
+
+
+def get_lastfm_recent_scrobbles(network: pylast.LastFMNetwork, hours: int = 2) -> Dict[str, List[int]]:
+    """
+    Fetch recent scrobbles from Last.fm within the specified time window.
+    Returns a dictionary mapping normalized (artist, title) to list of timestamps.
+    """
+    try:
+        # Calculate time window
+        current_time = int(time.time())
+        from_timestamp = current_time - (hours * 3600)
+
+        logger.info(f"Fetching Last.fm scrobbles from last {hours} hours...")
+
+        # Get user's recent tracks
+        user = network.get_user(LASTFM_USERNAME)
+        recent_tracks = user.get_recent_tracks(
+            limit=200,  # Get up to 200 tracks
+            time_from=from_timestamp,
+            time_to=current_time
+        )
+
+        # Build lookup dictionary with normalized track info
+        scrobble_map = {}
+        count = 0
+        currently_playing = None
+
+        for track in recent_tracks:
+            try:
+                # Extract track info
+                artist_obj = track.track.artist
+                artist_name = artist_obj.get_name() if artist_obj else ""
+                track_name = track.track.get_name() if track.track else ""
+
+                if not artist_name or not track_name:
+                    continue
+
+                # Check for "now playing" track
+                if hasattr(track, 'playback_status') and track.playback_status == 'now playing':
+                    currently_playing = (artist_name, track_name)
+                    logger.info(f"Currently playing on Last.fm: {artist_name} - {track_name}")
+                    continue
+
+                # Get timestamp
+                timestamp = int(track.timestamp) if hasattr(track, 'timestamp') and track.timestamp else None
+                if not timestamp:
+                    continue
+
+                # Normalize artist and title for matching
+                normalized_artist = normalize_text(artist_name, is_artist=True)
+                normalized_title = normalize_text(track_name, is_artist=False)
+                key = (normalized_artist, normalized_title)
+
+                # Add to map
+                if key not in scrobble_map:
+                    scrobble_map[key] = []
+                scrobble_map[key].append(timestamp)
+                count += 1
+
+            except Exception as e:
+                logger.warning(f"Error processing Last.fm track: {e}")
+                continue
+
+        logger.info(f"Found {count} scrobbles on Last.fm in recent window ({len(scrobble_map)} unique tracks)")
+        if currently_playing:
+            logger.info(f"Note: Currently playing track detected: {currently_playing[0]} - {currently_playing[1]}")
+
+        return scrobble_map
+
+    except Exception as e:
+        logger.error(f"Failed to fetch Last.fm recent scrobbles: {e}")
+        logger.warning("Continuing without Last.fm cross-reference (mobile detection disabled for this run)")
+        return {}
 
 
 def load_scrobble_history() -> Dict[str, Dict]:
@@ -147,19 +231,22 @@ def cleanup_old_history(history: Dict[str, Dict]) -> Dict[str, Dict]:
     """Remove scrobble records older than two weeks"""
     current_time = int(time.time())
     cutoff_time = current_time - TWO_WEEKS_SECONDS
-    
+
     cleaned_history = {}
     removed_count = 0
-    
-    for track_id, track_data in history.items():
-        if track_data.get('scrobbled_at', 0) >= cutoff_time:
-            cleaned_history[track_id] = track_data
+
+    for scrobble_key, track_data in history.items():
+        # Handle both old timestamp-based keys and new date-based keys
+        scrobbled_at = track_data.get('scrobbled_at', 0)
+
+        if scrobbled_at >= cutoff_time:
+            cleaned_history[scrobble_key] = track_data
         else:
             removed_count += 1
-    
+
     if removed_count > 0:
         logger.info(f"Cleaned up {removed_count} old scrobble records")
-    
+
     return cleaned_history
 
 
@@ -636,29 +723,38 @@ def get_track_duration_seconds(track: Dict) -> int:
         return 210
 
 
-def add_to_scrobble_history(track: Dict, timestamp: int) -> None:
-    """Add a track to the comprehensive scrobble history"""
+def add_to_scrobble_history(track: Dict, timestamp: int, source: str = "ytmusic_bot") -> None:
+    """Add a track to the comprehensive scrobble history with source tracking"""
     track_id = track['videoId']
     duration_seconds = get_track_duration_seconds(track)
-    
+
     track_data = {
         'artist': track['artists'][0]['name'],
         'title': track['title'],
         'album': track.get('album', {}).get('name', ''),
         'scrobbled_at': timestamp,
         'duration_seconds': duration_seconds,
+        'source': source,  # Track source: "ytmusic_bot" or "mobile_extension"
         'youtube_url': f"https://music.youtube.com/watch?v={track_id}"
     }
-    
+
     # Load existing history
     history = load_scrobble_history()
-    
-    # Create a unique key for this scrobble (track_id + timestamp)
-    scrobble_key = f"{track_id}_{timestamp}"
-    
+
+    # Create a unique key for this scrobble using date instead of timestamp
+    # This prevents duplicates when bot runs multiple times per day
+    # YouTube Music only provides "Today" anyway, so date-based is appropriate
+    scrobble_date = date.fromtimestamp(timestamp).isoformat()  # e.g., "2025-10-20"
+    scrobble_key = f"{track_id}_{scrobble_date}"
+
+    # Check if already scrobbled today
+    if scrobble_key in history:
+        logger.info(f"Track {track_id} already scrobbled today ({scrobble_date}), skipping duplicate")
+        return
+
     # Add new track with unique key
     history[scrobble_key] = track_data
-    
+
     # Clean up old entries and save
     cleaned_history = cleanup_old_history(history)
     save_scrobble_history(cleaned_history)
@@ -758,11 +854,11 @@ def can_scrobble_track_simple(track: Dict, proposed_timestamp: int, scrobble_his
     """Smart duplicate checking - prevent scrobbling same track too close based on track length"""
     track_id = track['videoId']
     track_duration = get_track_duration_seconds(track)
-    
+
     # Minimum gap: track duration + 30 seconds (allows for loops/repeats)
     min_gap_seconds = track_duration + 30
     cutoff_time = proposed_timestamp - min_gap_seconds
-    
+
     if track_id in scrobble_history:
         for timestamp_str in scrobble_history[track_id]:
             timestamp = int(timestamp_str)
@@ -770,14 +866,158 @@ def can_scrobble_track_simple(track: Dict, proposed_timestamp: int, scrobble_his
                 minutes_ago = (proposed_timestamp - timestamp) // 60
                 min_gap_minutes = min_gap_seconds // 60
                 return False, f"Already scrobbled {minutes_ago}m ago (need {min_gap_minutes}m gap for this track)"
-    
+
     return True, "Track ready to scrobble"
 
 
+def extract_today_tracks(ytmusic_history: List[Dict]) -> List[Dict]:
+    """
+    Extract tracks from recent history based on RECENT_WINDOW_HOURS.
+    YouTube Music history doesn't provide exact timestamps, just relative dates.
+    We extract based on the configured time window.
+    """
+    recent_tracks = []
+
+    # Determine which sections to include based on RECENT_WINDOW_HOURS
+    include_sections = ['today']
+
+    if RECENT_WINDOW_HOURS >= 24:  # 1+ days
+        include_sections.append('yesterday')
+
+    if RECENT_WINDOW_HOURS >= 48:  # 2+ days
+        include_sections.append('this week')
+
+    logger.info(f"Extracting tracks from sections: {include_sections} (RECENT_WINDOW_HOURS={RECENT_WINDOW_HOURS})")
+
+    for track in ytmusic_history:
+        # YouTube Music history items may have a 'played' field
+        played_info = track.get('played', '')
+
+        # Convert to lowercase for case-insensitive matching
+        played_info_lower = played_info.lower() if played_info else 'today'
+
+        # Check if this track's section should be included
+        should_include = False
+        for section in include_sections:
+            if section.lower() in played_info_lower:
+                should_include = True
+                break
+
+        # If no played info exists, assume it's recent (today)
+        if not track.get('played'):
+            should_include = True
+
+        if should_include:
+            recent_tracks.append(track)
+        # Continue processing all tracks within the time window (don't break early)
+
+    logger.info(f"Extracted {len(recent_tracks)} tracks from recent history ({RECENT_WINDOW_HOURS}h window)")
+    return recent_tracks
+
+
+def is_track_in_lastfm_recent(track: Dict, lastfm_scrobbles: Dict[str, List[int]]) -> Tuple[bool, Optional[int]]:
+    """
+    Check if a track exists in Last.fm recent scrobbles.
+    Returns (found, most_recent_timestamp) tuple.
+    """
+    if not lastfm_scrobbles:
+        return False, None
+
+    # Normalize track metadata
+    original_artist = track['artists'][0]['name']
+    original_title = track['title']
+
+    # Clean and normalize for matching
+    cleaned_artist, cleaned_title, _ = clean_track_metadata(original_artist, original_title, "")
+    normalized_artist = normalize_text(cleaned_artist, is_artist=True)
+    normalized_title = normalize_text(cleaned_title, is_artist=False)
+
+    key = (normalized_artist, normalized_title)
+
+    if key in lastfm_scrobbles:
+        timestamps = lastfm_scrobbles[key]
+        most_recent = max(timestamps) if timestamps else None
+        return True, most_recent
+
+    return False, None
+
+
+def process_today_tracks_with_gap_detection(
+    today_tracks: List[Dict],
+    lastfm_scrobbles: Dict[str, List[int]],
+    scrobble_history: Dict[str, Dict],
+    max_tracks: int = 20
+) -> List[Tuple[Dict, int]]:
+    """
+    Process 'Today' tracks with mobile gap detection.
+    Returns list of (track, estimated_timestamp) tuples for tracks that should be scrobbled.
+    """
+    tracks_to_scrobble = []
+    current_time = int(time.time())
+    cumulative_offset = 0
+
+    logger.info(f"Processing {len(today_tracks)} tracks from 'Today' with mobile gap detection...")
+    logger.info("="*60)
+
+    for i, track in enumerate(reversed(today_tracks)):  # Process oldest to newest
+        track_id = track['videoId']
+        artist = track['artists'][0]['name']
+        title = track['title']
+        duration = get_track_duration_seconds(track)
+
+        # Estimate timestamp working backwards from current time
+        estimated_timestamp = current_time - cumulative_offset
+        cumulative_offset += duration + 30  # Track duration + 30s buffer
+
+        # Don't go back more than 24 hours
+        if cumulative_offset > 86400:
+            logger.info(f"  ⏸️  Stopping: Reached 24-hour limit")
+            break
+
+        # Check against Last.fm recent scrobbles (mobile detection)
+        found_in_lastfm, lastfm_timestamp = is_track_in_lastfm_recent(track, lastfm_scrobbles)
+
+        if found_in_lastfm and ENABLE_MOBILE_DETECTION:
+            time_diff_minutes = abs(estimated_timestamp - lastfm_timestamp) // 60 if lastfm_timestamp else 0
+            logger.info(f"  ✓ {artist} - {title}")
+            logger.info(f"    └─ Found on Last.fm (~{time_diff_minutes}m difference), skipping (mobile scrobble)")
+            continue
+
+        # Check against local bot history using date-based key
+        # This prevents duplicates across multiple runs on the same day
+        scrobble_date = date.today().isoformat()  # e.g., "2025-10-20"
+        scrobble_key = f"{track_id}_{scrobble_date}"
+
+        if scrobble_key in scrobble_history:
+            logger.info(f"  ✓ {artist} - {title}")
+            logger.info(f"    └─ Already scrobbled today, skipping")
+            continue
+
+        # Track is clear to scrobble!
+        tracks_to_scrobble.append((track, estimated_timestamp))
+        timestamp_str = datetime.datetime.fromtimestamp(estimated_timestamp).strftime('%H:%M:%S')
+        logger.info(f"  → {artist} - {title}")
+        logger.info(f"    └─ Will scrobble at {timestamp_str} (estimated)")
+
+        # Respect max tracks limit
+        if len(tracks_to_scrobble) >= max_tracks:
+            logger.info(f"  ⏸️  Stopping: Reached max tracks limit ({max_tracks})")
+            break
+
+    logger.info("="*60)
+    logger.info(f"Result: {len(tracks_to_scrobble)} tracks ready to scrobble (out of {len(today_tracks)} from today)")
+
+    return tracks_to_scrobble
+
+
 def main():
-    """Main scrobbling function with comprehensive history tracking"""
-    logger.info("Starting YouTube Music scrobbler with comprehensive history tracking...")
-    
+    """Main scrobbling function with mobile gap-filling and smart detection"""
+    mode_str = "DRY RUN MODE" if DRY_RUN else "LIVE MODE"
+    logger.info(f"Starting YouTube Music scrobbler with mobile gap-filling ({mode_str})...")
+
+    if DRY_RUN:
+        logger.info("⚠️  DRY RUN: No tracks will be actually scrobbled")
+
     # Connect to Last.fm
     try:
         network = pylast.LastFMNetwork(
@@ -790,77 +1030,102 @@ def main():
     except Exception as e:
         logger.error(f"Failed to connect to Last.fm: {e}")
         sys.exit(1)
-    
+
+    # Fetch Last.fm recent scrobbles (for mobile detection)
+    lastfm_recent_scrobbles = {}
+    if ENABLE_MOBILE_DETECTION:
+        lastfm_recent_scrobbles = get_lastfm_recent_scrobbles(network, RECENT_WINDOW_HOURS)
+        if not lastfm_recent_scrobbles:
+            logger.warning("Mobile detection enabled but no recent Last.fm scrobbles found")
+    else:
+        logger.info("Mobile detection disabled (will scrobble all tracks from YouTube Music)")
+
     # Login to YouTube Music
     ytmusic = login_to_ytmusic()
     if not ytmusic:
         logger.error("Failed to login to YouTube Music")
         sys.exit(1)
-    
+
     # Get listening history
     ytmusic_history = get_listening_history(ytmusic)
     if not ytmusic_history:
         logger.warning("No listening history available")
         return
-    
+
     # Load comprehensive scrobble history
     scrobble_history = load_scrobble_history()
-    
+
     # Clean up old history entries (older than 2 weeks) and save cleaned version
     cleaned_history = cleanup_old_history(scrobble_history)
     if len(cleaned_history) != len(scrobble_history):
-        # Only save if we actually removed entries (avoid unnecessary disk writes)
         save_scrobble_history(cleaned_history)
-        logger.info(f"Saved cleaned history with {len(cleaned_history)} entries")
+        logger.info(f"Cleaned up history: {len(scrobble_history)} → {len(cleaned_history)} entries")
     scrobble_history = cleaned_history
-    
-    # Get the last processed track ID to avoid reprocessing
-    last_processed_track_id = get_last_processed_track_id()
-    
-    # Find only NEW tracks that need to be scrobbled
-    tracks_to_scrobble = find_new_tracks_to_scrobble(ytmusic_history, scrobble_history, last_processed_track_id)
-    
-    if not tracks_to_scrobble:
-        logger.info("No new tracks to scrobble")
+
+    # Extract 'Today' tracks from YouTube Music history
+    today_tracks = extract_today_tracks(ytmusic_history)
+
+    if not today_tracks:
+        logger.info("No tracks from 'Today' found in YouTube Music history")
         return
-    
-    # Scrobble tracks with their calculated timestamps
+
+    # Process tracks with mobile gap detection
+    tracks_to_scrobble = process_today_tracks_with_gap_detection(
+        today_tracks,
+        lastfm_recent_scrobbles,
+        scrobble_history,
+        MAX_SCROBBLES_PER_RUN
+    )
+
+    if not tracks_to_scrobble:
+        logger.info("No new tracks to scrobble (all tracks either on Last.fm or in bot history)")
+        return
+
+    # Summary before scrobbling
+    logger.info("")
+    logger.info(f"📊 Summary: Will scrobble {len(tracks_to_scrobble)} tracks")
+    if DRY_RUN:
+        logger.info("⚠️  DRY RUN: Showing what would be scrobbled (not actually scrobbling)")
+    logger.info("")
+
+    # Scrobble tracks with their estimated timestamps
     successful_scrobbles = 0
-    most_recent_track_id = None
-    
+
     for i, (track, timestamp) in enumerate(tracks_to_scrobble):
         track_id = track['videoId']
         artist = track['artists'][0]['name']
         title = track['title']
-        
+
         timestamp_str = datetime.datetime.fromtimestamp(timestamp).strftime('%Y-%m-%d %H:%M:%S')
-        logger.info(f"Scrobbling track {i+1}/{len(tracks_to_scrobble)}: {artist} - {title} at {timestamp_str}")
-        
-        if scrobble_track(network, track, timestamp):
-            # Add to comprehensive history with the actual timestamp used
-            add_to_scrobble_history(track, timestamp)
+
+        if DRY_RUN:
+            logger.info(f"[DRY RUN] Would scrobble: {artist} - {title} at {timestamp_str}")
             successful_scrobbles += 1
-            most_recent_track_id = track_id
         else:
-            logger.error(f"Failed to scrobble: {artist} - {title}")
-        
-        # Always update the last processed track ID (even if scrobble failed)
-        # This prevents reprocessing the same tracks over and over
-        save_last_processed_track_id(track_id)
-        
-        # Small delay between scrobbles to avoid rate limiting
-        if i < len(tracks_to_scrobble) - 1:
-            time.sleep(2)
-    
-    # Update legacy history file with most recent track
-    if most_recent_track_id:
-        save_last_scrobbled(most_recent_track_id)
-    
-    if successful_scrobbles > 0:
-        logger.info(f"Successfully scrobbled {successful_scrobbles}/{len(tracks_to_scrobble)} tracks")
+            logger.info(f"Scrobbling ({i+1}/{len(tracks_to_scrobble)}): {artist} - {title} at {timestamp_str}")
+
+            if scrobble_track(network, track, timestamp):
+                # Add to comprehensive history with the actual timestamp used
+                add_to_scrobble_history(track, timestamp, source="ytmusic_bot")
+                successful_scrobbles += 1
+            else:
+                logger.error(f"Failed to scrobble: {artist} - {title}")
+
+            # Small delay between scrobbles to avoid rate limiting
+            if i < len(tracks_to_scrobble) - 1:
+                time.sleep(2)
+
+    # Summary
+    logger.info("")
+    if DRY_RUN:
+        logger.info(f"✅ DRY RUN completed: {successful_scrobbles} tracks would be scrobbled")
+        logger.info(f"   Run without --dry-run to actually scrobble these tracks")
     else:
-        logger.error("No tracks were successfully scrobbled")
-        sys.exit(1)
+        if successful_scrobbles > 0:
+            logger.info(f"✅ Successfully scrobbled {successful_scrobbles}/{len(tracks_to_scrobble)} tracks")
+        else:
+            logger.error("❌ No tracks were successfully scrobbled")
+            sys.exit(1)
 
 
 if __name__ == "__main__":

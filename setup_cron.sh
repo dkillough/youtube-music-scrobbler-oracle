@@ -1,82 +1,56 @@
 #!/bin/bash
-# Set up cron job for YTMusic Scrobbler
+# Cron setup script for YTMusic Scrobbler
 
-set -e
+if [ $# -eq 0 ]; then
+    echo "Usage: $0 <interval_minutes>"
+    echo "Example: $0 120   # Run every 2 hours (recommended for mobile gap-filling)"
+    echo "Example: $0 180   # Run every 3 hours"
+    echo "Example: $0 240   # Run every 4 hours"
+    exit 1
+fi
 
+INTERVAL=$1
 SERVICE_DIR="/opt/ytmusic-scrobbler"
 SERVICE_USER="ytmusic"
-DEFAULT_INTERVAL=5  # Default to 5 minutes
-
-# Get interval from command line argument or use default
-INTERVAL_MINUTES=${1:-$DEFAULT_INTERVAL}
 
 # Validate interval
-if ! [[ "$INTERVAL_MINUTES" =~ ^[0-9]+$ ]] || [ "$INTERVAL_MINUTES" -lt 1 ]; then
-    echo "❌ Invalid interval: $INTERVAL_MINUTES"
-    echo "Usage: $0 [interval_minutes]"
-    echo "Example: $0 5  # Run every 5 minutes"
+if ! [[ "$INTERVAL" =~ ^[0-9]+$ ]] || [ "$INTERVAL" -lt 1 ] || [ "$INTERVAL" -gt 1440 ]; then
+    echo "❌ Invalid interval. Must be a number between 1 and 1440 minutes."
     exit 1
 fi
 
-echo "⏰ Setting up cron job to run every $INTERVAL_MINUTES minutes..."
+echo "⏰ Setting up cron job to run every $INTERVAL minutes..."
 
-# Check if running as root
-if [[ $EUID -ne 0 ]]; then
-   echo "❌ This script must be run as root (use sudo)"
-   exit 1
-fi
-
-# Check if service directory exists
-if [ ! -d "$SERVICE_DIR" ]; then
-    echo "❌ Service directory $SERVICE_DIR not found. Please run deploy.sh first."
-    exit 1
-fi
-
-# Check if service user exists
-if ! id "$SERVICE_USER" &>/dev/null; then
-    echo "❌ Service user $SERVICE_USER not found. Please run deploy.sh first."
-    exit 1
-fi
-
-# Create cron schedule based on interval
-if [ "$INTERVAL_MINUTES" -eq 1 ]; then
-    CRON_SCHEDULE="* * * * *"
-elif [ "$INTERVAL_MINUTES" -lt 60 ]; then
-    CRON_SCHEDULE="*/$INTERVAL_MINUTES * * * *"
+# Calculate cron expression based on interval
+if [ "$INTERVAL" -lt 60 ]; then
+    # Less than an hour - use minute interval
+    CRON_EXPR="*/$INTERVAL * * * *"
+elif [ "$INTERVAL" -eq 60 ]; then
+    # Exactly one hour
+    CRON_EXPR="0 * * * *"
 else
-    HOUR_INTERVAL=$((INTERVAL_MINUTES / 60))
-    CRON_SCHEDULE="0 */$HOUR_INTERVAL * * *"
+    # Multiple hours
+    HOUR_INTERVAL=$((INTERVAL / 60))
+    MINUTE_REMAINDER=$((INTERVAL % 60))
+
+    if [ "$MINUTE_REMAINDER" -eq 0 ]; then
+        CRON_EXPR="0 */$HOUR_INTERVAL * * *"
+    else
+        # For non-whole hours, fall back to minute-based expression
+        CRON_EXPR="*/$INTERVAL * * * *"
+    fi
 fi
 
-# Create the cron command
-CRON_COMMAND="$SERVICE_DIR/venv/bin/python3 $SERVICE_DIR/scrobble_oracle.py"
+# Add to user's crontab
+(sudo -u "$SERVICE_USER" crontab -l 2>/dev/null | grep -v "$SERVICE_DIR/scrobble_oracle.py"; echo "$CRON_EXPR $SERVICE_DIR/venv/bin/python3 $SERVICE_DIR/scrobble_oracle.py >> $SERVICE_DIR/config/scrobble.log 2>&1") | sudo -u "$SERVICE_USER" crontab -
 
-# Create temporary cron file
-TEMP_CRON=$(mktemp)
+echo "✅ Cron job configured successfully!"
+echo "📋 Current crontab for $SERVICE_USER:"
+sudo -u "$SERVICE_USER" crontab -l
 
-# Get existing crontab for the service user (if any)
-sudo -u "$SERVICE_USER" crontab -l 2>/dev/null > "$TEMP_CRON" || true
-
-# Remove any existing ytmusic-scrobbler entries
-grep -v "ytmusic-scrobbler" "$TEMP_CRON" > "${TEMP_CRON}.new" || true
-mv "${TEMP_CRON}.new" "$TEMP_CRON"
-
-# Add new cron entry
-echo "# YTMusic Scrobbler - runs every $INTERVAL_MINUTES minutes" >> "$TEMP_CRON"
-echo "$CRON_SCHEDULE $CRON_COMMAND # ytmusic-scrobbler" >> "$TEMP_CRON"
-
-# Install the new crontab
-sudo -u "$SERVICE_USER" crontab "$TEMP_CRON"
-
-# Clean up
-rm "$TEMP_CRON"
-
-echo "✅ Cron job installed successfully!"
-echo "📅 Schedule: Every $INTERVAL_MINUTES minutes ($CRON_SCHEDULE)"
-echo "👤 Running as: $SERVICE_USER"
-echo "🔧 Command: $CRON_COMMAND"
 echo ""
-echo "📋 Useful commands:"
-echo "  View cron jobs: sudo -u $SERVICE_USER crontab -l"
-echo "  View logs: sudo -u $SERVICE_USER tail -f $SERVICE_DIR/config/scrobble.log"
-echo "  Remove cron job: sudo -u $SERVICE_USER crontab -e  # then delete the ytmusic-scrobbler line"
+echo "🔧 Management commands:"
+echo "  View logs:     sudo -u $SERVICE_USER tail -f $SERVICE_DIR/config/scrobble.log"
+echo "  Manual run:    sudo -u $SERVICE_USER $SERVICE_DIR/venv/bin/python3 $SERVICE_DIR/scrobble_oracle.py"
+echo "  Dry run:       sudo -u $SERVICE_USER $SERVICE_DIR/venv/bin/python3 $SERVICE_DIR/scrobble_oracle.py --dry-run"
+echo "  View history:  sudo -u $SERVICE_USER $SERVICE_DIR/venv/bin/python3 $SERVICE_DIR/history_manager.py stats"
