@@ -77,3 +77,4 @@ logs/
 # Local test files (if any)
 test_local*
 *_test_local*
+config
