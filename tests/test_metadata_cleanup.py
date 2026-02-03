@@ -28,9 +28,12 @@ def clean_youtube_metadata(text: str, is_artist: bool = False) -> str:
     
     for suffix in youtube_suffixes:
         text = re.sub(suffix, '', text, flags=re.IGNORECASE)
-    
+
     # Clean up common YouTube title additions (for titles, not artists)
     if not is_artist:
+        # Remove ALL content within square brackets (e.g., [Remaster], [Live], [Audio], etc.)
+        text = re.sub(r'\s*\[.*?\]\s*', ' ', text)
+
         title_cleanups = [
             # End-of-string patterns (original behavior)
             r'\s*\(Official Video\)$',
@@ -61,17 +64,17 @@ def clean_youtube_metadata(text: str, is_artist: bool = False) -> str:
             r'\s*\(4K\)\s+',
             r'\s*\[4K\]\s+',
         ]
-        
+
         # First handle end-of-string patterns (remove completely)
         end_patterns = title_cleanups[:13]  # First 13 are end patterns
         for cleanup in end_patterns:
             text = re.sub(cleanup, '', text, flags=re.IGNORECASE)
-        
+
         # Then handle middle-of-string patterns (replace with single space)
         middle_patterns = title_cleanups[13:]  # Remaining are middle patterns
         for cleanup in middle_patterns:
             text = re.sub(cleanup, ' ', text, flags=re.IGNORECASE)
-    
+
     return text.strip()
 
 
@@ -79,33 +82,32 @@ def normalize_featuring_artists(text: str) -> str:
     """Normalize featuring artist variations"""
     if not text:
         return ""
-    
-    # Comprehensive featuring variations with word boundaries
+
+    # Comprehensive featuring variations - preserve surrounding whitespace
     featuring_patterns = [
-        r'\s*\bfeaturing\b\s*',  # Exact word "featuring"
-        r'\s*\bfeat\.\s*',       # "feat." with period
-        r'\s*\bfeat\b\s*',       # "feat" without period  
-        r'\s*\bft\.\s*',         # "ft." with period
-        r'\s*\bft\b\s*',         # "ft" without period
-        r'\s*\bwith\b\s*',       # "with" as exact word
-        r'\s*\bx\b\s*',          # "x" as exact word (common in hip-hop/rap)
-        r'\s*\bversus\b\s*',     # "versus" as exact word
-        r'\s*\bvs\.\s*',         # "vs." with period
-        r'\s*\bvs\b\s*',         # "vs" without period
-        r'\s*\band\b\s*',        # "and" as exact word (only in featuring context)
-        r'\s*&\s*',              # "&" symbol (common in collaborations)
+        (r'\bfeaturing\b', 'feat.'),  # Exact word "featuring"
+        (r'\bfeat\b(?!\.)', 'feat.'),  # "feat" without period (add period)
+        (r'\bft\.', 'feat.'),          # "ft." with period
+        (r'\bft\b(?!\.)', 'feat.'),    # "ft" without period
+        (r'\bwith\b', 'feat.'),        # "with" as exact word
+        (r'\bx\b', 'feat.'),           # "x" as exact word (common in hip-hop/rap)
+        (r'\bversus\b', 'feat.'),      # "versus" as exact word
+        (r'\bvs\.', 'feat.'),          # "vs." with period
+        (r'\bvs\b(?!\.)', 'feat.'),    # "vs" without period
+        (r'\band\b', 'feat.'),         # "and" as exact word (only in featuring context)
+        (r'&', 'feat.'),               # "&" symbol (common in collaborations)
     ]
-    
-    # Replace all variations with consistent " ft "
-    for pattern in featuring_patterns:
-        text = re.sub(pattern, ' ft ', text, flags=re.IGNORECASE)
-    
-    # Clean up multiple ft occurrences
-    text = re.sub(r'\s*ft\s+ft\s*', ' ft ', text)
-    
+
+    # Replace all variations with consistent "feat." (preserving whitespace)
+    for pattern, replacement in featuring_patterns:
+        text = re.sub(pattern, replacement, text, flags=re.IGNORECASE)
+
+    # Clean up multiple feat. occurrences
+    text = re.sub(r'\bfeat\.\s+feat\.', 'feat.', text, flags=re.IGNORECASE)
+
     # Clean up extra spaces
     text = re.sub(r'\s+', ' ', text)
-    
+
     return text.strip()
 
 
@@ -113,26 +115,11 @@ def normalize_remix_versions(text: str) -> str:
     """Normalize remix and version information"""
     if not text:
         return ""
-    
-    # Common remix/version patterns to standardize
-    version_patterns = [
-        (r'\s*\(Radio Edit\)', ' (Radio Edit)'),
-        (r'\s*\(Extended Mix\)', ' (Extended Mix)'),
-        (r'\s*\(Club Mix\)', ' (Club Mix)'),
-        (r'\s*\(Original Mix\)', ''),  # Remove "Original Mix" as it's redundant
-        (r'\s*\(Remix\)', ' (Remix)'),
-        (r'\s*\(Remaster\)', ' (Remaster)'),
-        (r'\s*\(Remastered\)', ' (Remastered)'),
-        (r'\s*\(Deluxe Edition\)', ' (Deluxe Edition)'),
-        (r'\s*\(Deluxe Version\)', ' (Deluxe Edition)'),
-        (r'\s*\(Acoustic\)', ' (Acoustic)'),
-        (r'\s*\(Live\)', ' (Live)'),
-        (r'\s*\(Instrumental\)', ' (Instrumental)'),
-    ]
-    
-    for pattern, replacement in version_patterns:
-        text = re.sub(pattern, replacement, text, flags=re.IGNORECASE)
-    
+
+    # Only remove truly redundant tags like "Original Mix"
+    # Preserve all other version information exactly as-is to match Last.fm
+    text = re.sub(r'\s*\(Original Mix\)', '', text, flags=re.IGNORECASE)
+
     return text.strip()
 
 
@@ -164,25 +151,33 @@ def test_metadata_cleanup():
         ("Taylor Swift - Topic", "Anti-Hero (Official Music Video)", "Taylor Swift", "Anti-Hero", "YouTube suffixes removal"),
         ("Drake VEVO", "God's Plan", "Drake", "God's Plan", "VEVO suffix removal"),
         ("The Beatles", "Hey Jude [Official Video]", "The Beatles", "Hey Jude", "Bracketed suffix removal"),
-        
+
         # Featuring variations
-        ("Post Malone feat. 21 Savage", "rockstar", "Post Malone ft 21 Savage", "rockstar", "feat. normalization"),
-        ("The Weeknd featuring Daft Punk", "Starboy", "The Weeknd ft Daft Punk", "Starboy", "featuring normalization"),
-        ("Artist x Collaborator", "Song Title", "Artist ft Collaborator", "Song Title", "x normalization"),
-        ("Artist & Other Artist", "Song", "Artist ft Other Artist", "Song", "& normalization"),
-        
+        ("Post Malone feat. 21 Savage", "rockstar", "Post Malone feat. 21 Savage", "rockstar", "feat. normalization"),
+        ("The Weeknd featuring Daft Punk", "Starboy", "The Weeknd feat. Daft Punk", "Starboy", "featuring normalization"),
+        ("Artist x Collaborator", "Song Title", "Artist feat. Collaborator", "Song Title", "x normalization"),
+        ("Artist & Other Artist", "Song", "Artist feat. Other Artist", "Song", "& normalization"),
+
         # Remix/Version handling
         ("DJ Snake", "Taki Taki (Original Mix)", "DJ Snake", "Taki Taki", "Original Mix removal"),
         ("Calvin Harris", "Feel So Close (Radio Edit)", "Calvin Harris", "Feel So Close (Radio Edit)", "Radio Edit preservation"),
         ("Avicii", "Levels (Extended Mix)", "Avicii", "Levels (Extended Mix)", "Extended Mix preservation"),
-        ("Artist", "Song (Deluxe Version)", "Artist", "Song (Deluxe Edition)", "Version standardization"),
-        
+        ("Artist", "Song (Deluxe Version)", "Artist", "Song (Deluxe Version)", "Deluxe Version preservation"),
+
         # Complex cases
-        ("Martin Garrix - Topic", "Animals (Official Video) feat. Someone", "Martin Garrix", "Animals ft Someone", "Multiple issues"),
+        ("Martin Garrix - Topic", "Animals (Official Video) feat. Someone", "Martin Garrix", "Animals feat. Someone", "Multiple issues"),
         ("Artist VEVO", "Song (Original Mix) [HD]", "Artist", "Song", "Multiple cleanups"),
-        
+
+        # Square bracket removal
+        ("The Beatles", "Let It Be [Remastered 2009]", "The Beatles", "Let It Be", "Remaster bracket removal"),
+        ("Queen", "Bohemian Rhapsody [Live at Wembley]", "Queen", "Bohemian Rhapsody", "Live performance bracket removal"),
+        ("Pink Floyd", "Comfortably Numb [2011 Remaster]", "Pink Floyd", "Comfortably Numb", "Year remaster bracket removal"),
+        ("Artist", "Song [Radio Edit] feat. Someone", "Artist", "Song feat. Someone", "Bracket with featuring"),
+        ("Artist", "Song [Explicit] [Remastered]", "Artist", "Song", "Multiple brackets removal"),
+        ("Artist", "Song [Audio]", "Artist", "Song", "Audio bracket removal"),
+
         # Edge cases
-        ("Artist ft. Someone", "Song ft. Other", "Artist ft Someone", "Song ft Other", "Existing ft. normalization"),
+        ("Artist ft. Someone", "Song ft. Other", "Artist feat. Someone", "Song feat. Other", "Existing ft. normalization"),
         ("", "Empty Artist Test", "", "Empty Artist Test", "Empty artist handling"),
         ("Artist", "", "Artist", "", "Empty title handling"),
     ]

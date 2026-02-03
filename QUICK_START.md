@@ -214,6 +214,94 @@ ENABLE_MOBILE_DETECTION=false   # Don't cross-reference
 MAX_SCROBBLES_PER_RUN=50        # More tracks since no overlap
 ```
 
+## Multi-User Setup
+
+This scrobbler supports running multiple instances for different Last.fm users on the same server.
+
+### Adding Additional Users
+
+To add another user (e.g., a second Last.fm account):
+
+#### 1. Deploy New User Instance
+```bash
+sudo bash deploy_user.sh <username> <lastfm_username> <cron_minutes>
+
+# Examples:
+# User 'momo_kz' with 2-hour interval
+sudo bash deploy_user.sh momo_kz momo_kz 120
+
+# User 'alice' with 3-hour interval
+sudo bash deploy_user.sh alice alice_music 180
+```
+
+Parameters:
+- `username`: Directory name (alphanumeric + underscores only)
+- `lastfm_username`: Last.fm username
+- `cron_minutes`: How often to run (e.g., 60=hourly, 120=2hrs, 180=3hrs)
+
+#### 2. Configure Last.fm Credentials
+```bash
+sudo -u ytmusic nano /opt/ytmusic-scrobbler-<username>/.env
+```
+
+Fill in the Last.fm API credentials for that user.
+
+#### 3. Set Up YouTube Music Credentials
+```bash
+sudo -u ytmusic /opt/ytmusic-scrobbler-<username>/venv/bin/python3 \
+    /opt/ytmusic-scrobbler-<username>/setup_credentials.py
+```
+
+#### 4. Test the New Instance
+```bash
+# Dry run to verify
+sudo -u ytmusic /opt/ytmusic-scrobbler-<username>/venv/bin/python3 \
+    /opt/ytmusic-scrobbler-<username>/scrobble_oracle.py --dry-run
+
+# Check cron entries
+sudo -u ytmusic crontab -l
+```
+
+### Per-User Operations
+
+Each user instance is completely isolated. Use the username in paths:
+
+#### View Logs
+```bash
+# User 1 (dkiiro)
+sudo -u ytmusic tail -f /opt/ytmusic-scrobbler/config/scrobble.log
+
+# User 2 (momo_kz)
+sudo -u ytmusic tail -f /opt/ytmusic-scrobbler-momo_kz/config/scrobble.log
+
+# Other users
+sudo -u ytmusic tail -f /opt/ytmusic-scrobbler-<username>/config/scrobble.log
+```
+
+#### Manual Run
+```bash
+sudo -u ytmusic /opt/ytmusic-scrobbler-<username>/venv/bin/python3 \
+    /opt/ytmusic-scrobbler-<username>/scrobble_oracle.py
+```
+
+#### View History
+```bash
+sudo -u ytmusic /opt/ytmusic-scrobbler-<username>/venv/bin/python3 \
+    /opt/ytmusic-scrobbler-<username>/history_manager.py stats
+```
+
+### Current Instances
+
+Check all deployed instances:
+```bash
+ls -la /opt/ | grep ytmusic-scrobbler
+```
+
+View all cron schedules:
+```bash
+sudo -u ytmusic crontab -l
+```
+
 ## What to Expect
 
 ### First Run
@@ -227,7 +315,6 @@ MAX_SCROBBLES_PER_RUN=50        # More tracks since no overlap
 - Only fills gaps in your Last.fm history
 
 ### What NOT to Expect
-- ❌ Bot won't scrobble old history (yesterday or older)
 - ❌ Won't detect loops perfectly (YouTube Music limitation)
 - ❌ Timestamps are estimated, not exact
 - ❌ Can't replace mobile extensions (designed to complement them)
