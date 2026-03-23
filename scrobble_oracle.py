@@ -65,6 +65,7 @@ BROWSER_CONFIG = CONFIG_DIR / "browser.json"
 HISTORY_FILE = CONFIG_DIR / "history.txt"  # Legacy single track ID file
 SCROBBLE_HISTORY_FILE = CONFIG_DIR / "scrobble_history.json"  # Comprehensive scrobble history
 ERROR_CREDS_FILE = CONFIG_DIR / "erroredcreds.json"
+HISTORY_SNAPSHOT_FILE = CONFIG_DIR / "history_snapshot.json"  # For replay detection between runs
 
 # Configuration constants
 TWO_WEEKS_SECONDS = 14 * 24 * 60 * 60  # 14 days in seconds
@@ -248,6 +249,107 @@ def cleanup_old_history(history: Dict[str, Dict]) -> Dict[str, Dict]:
         logger.info(f"Cleaned up {removed_count} old scrobble records")
 
     return cleaned_history
+
+
+def load_history_snapshot() -> Optional[Dict]:
+    """Load the previous YouTube Music history snapshot for replay detection"""
+    try:
+        if HISTORY_SNAPSHOT_FILE.exists():
+            with open(HISTORY_SNAPSHOT_FILE, 'r', encoding='utf-8') as f:
+                return json.load(f)
+        return None
+    except Exception as e:
+        logger.warning(f"Error loading history snapshot: {e}")
+        return None
+
+
+def save_history_snapshot(ytmusic_history: List[Dict]) -> None:
+    """Save current YouTube Music history order as a snapshot for next run's replay detection"""
+    try:
+        snapshot = {
+            "timestamp": int(time.time()),
+            "history_order": [t.get('videoId', '') for t in ytmusic_history if t.get('videoId')]
+        }
+        with open(HISTORY_SNAPSHOT_FILE, 'w', encoding='utf-8') as f:
+            json.dump(snapshot, f, indent=2)
+        logger.info(f"Saved history snapshot with {len(snapshot['history_order'])} tracks")
+    except Exception as e:
+        logger.warning(f"Error saving history snapshot: {e}")
+
+
+def detect_replays(current_history: List[Dict], scrobble_history: Dict[str, Dict]) -> Dict[str, int]:
+    """
+    Compare current YouTube Music history order against previous snapshot.
+    Returns a dict of {videoId: replay_count} for tracks that were replayed between runs.
+
+    Detection methods:
+    - Track moved UP in position (closer to index 0) → 1 replay
+    - Track stayed at position 0 AND enough time since last scrobble → 1 back-to-back replay
+    """
+    previous_snapshot = load_history_snapshot()
+    if not previous_snapshot:
+        logger.info("No previous history snapshot found, cannot detect replays")
+        return {}
+
+    prev_order = previous_snapshot.get('history_order', [])
+    snapshot_timestamp = previous_snapshot.get('timestamp', 0)
+
+    if not prev_order:
+        return {}
+
+    # Build position lookup for previous snapshot
+    prev_positions = {}
+    for i, vid_id in enumerate(prev_order):
+        if vid_id not in prev_positions:  # Keep first (highest) position
+            prev_positions[vid_id] = i
+
+    replays = {}
+    current_time = int(time.time())
+
+    for curr_pos, track in enumerate(current_history):
+        vid_id = track.get('videoId')
+        if not vid_id:
+            continue
+
+        prev_pos = prev_positions.get(vid_id)
+        if prev_pos is None:
+            # Track is new (not in previous snapshot) — not a replay
+            continue
+
+        if curr_pos < prev_pos:
+            # Track moved UP in the list — likely replayed
+            artist = safe_get_artist_name(track)
+            title = safe_get_title(track)
+            logger.info(f"Replay detected: {artist} - {title} (position {prev_pos} -> {curr_pos})")
+            replays[vid_id] = replays.get(vid_id, 0) + 1
+        elif curr_pos == 0 and prev_pos == 0:
+            # Track stayed at position 0 — possible back-to-back replay
+            # Only count if enough time has passed since last scrobble
+            duration = get_track_duration_seconds(track)
+            min_elapsed = duration * 2  # At least 2x track duration since snapshot
+
+            time_since_snapshot = current_time - snapshot_timestamp
+            if time_since_snapshot >= min_elapsed:
+                # Verify against scrobble_history timestamps
+                scrobble_date = date.today().isoformat()
+                prefix = f"{vid_id}_{scrobble_date}"
+                last_scrobble_ts = 0
+                for key, data in scrobble_history.items():
+                    if key.startswith(prefix):
+                        last_scrobble_ts = max(last_scrobble_ts, data.get('scrobbled_at', 0))
+
+                if last_scrobble_ts > 0 and (current_time - last_scrobble_ts) >= duration + 30:
+                    artist = safe_get_artist_name(track)
+                    title = safe_get_title(track)
+                    logger.info(f"Back-to-back replay detected: {artist} - {title} (stayed at position 0, {time_since_snapshot}s since snapshot)")
+                    replays[vid_id] = replays.get(vid_id, 0) + 1
+
+    if replays:
+        logger.info(f"Detected {sum(replays.values())} replay(s) across {len(replays)} track(s)")
+    else:
+        logger.info("No replays detected from position analysis")
+
+    return replays
 
 
 def get_last_scrobbled():
@@ -995,11 +1097,29 @@ def is_track_in_lastfm_recent(track: Dict, lastfm_scrobbles: Dict[str, List[int]
     return False, None
 
 
+def is_bot_scrobble(track_id: str, lastfm_timestamp: int, scrobble_history: Dict[str, Dict], tolerance_seconds: int = 120) -> bool:
+    """
+    Check if a Last.fm scrobble timestamp matches one of the bot's own scrobbles.
+    Returns True if the lastfm_timestamp is within tolerance_seconds of any
+    scrobble in our history for this track_id with source="ytmusic_bot".
+    """
+    for scrobble_key, scrobble_data in scrobble_history.items():
+        if not scrobble_key.startswith(f"{track_id}_"):
+            continue
+        if scrobble_data.get('source') != 'ytmusic_bot':
+            continue
+        bot_timestamp = scrobble_data.get('scrobbled_at', 0)
+        if abs(bot_timestamp - lastfm_timestamp) <= tolerance_seconds:
+            return True
+    return False
+
+
 def process_today_tracks_with_gap_detection(
     today_tracks: List[Dict],
     lastfm_scrobbles: Dict[str, List[int]],
     scrobble_history: Dict[str, Dict],
-    max_tracks: int = 20
+    max_tracks: int = 20,
+    detected_replays: Dict[str, int] = None
 ) -> List[Tuple[Dict, int]]:
     """
     Process 'Today' tracks with mobile gap detection.
@@ -1034,17 +1154,27 @@ def process_today_tracks_with_gap_detection(
         found_in_lastfm, lastfm_timestamp = is_track_in_lastfm_recent(track, lastfm_scrobbles)
 
         if found_in_lastfm and ENABLE_MOBILE_DETECTION:
-            time_diff_minutes = abs(estimated_timestamp - lastfm_timestamp) // 60 if lastfm_timestamp else 0
-            logger.info(f"  ✓ {artist} - {title}")
-            logger.info(f"    └─ Found on Last.fm (~{time_diff_minutes}m difference), skipping (mobile scrobble)")
-            continue
+            # Check if this Last.fm scrobble was made by the bot itself
+            if lastfm_timestamp and is_bot_scrobble(track_id, lastfm_timestamp, scrobble_history):
+                logger.info(f"  ℹ {artist} - {title}")
+                logger.info(f"    └─ Found on Last.fm but matches bot's own scrobble, checking counter logic...")
+                # Fall through to counter-based dedup below
+            else:
+                time_diff_minutes = abs(estimated_timestamp - lastfm_timestamp) // 60 if lastfm_timestamp else 0
+                logger.info(f"  ✓ {artist} - {title}")
+                logger.info(f"    └─ Found on Last.fm (~{time_diff_minutes}m difference), skipping (mobile scrobble)")
+                continue
 
         # Check against local bot history using counter-based approach
         # Count how many times this track appears in YouTube history vs our scrobble history
         scrobble_date = date.today().isoformat()  # e.g., "2025-12-20"
 
-        # Count occurrences in YouTube Music history (today_tracks)
-        youtube_count = sum(1 for t in today_tracks if t.get('videoId') == track_id)
+        # Count occurrences in YouTube Music history (today_tracks) + detected replays
+        youtube_api_count = sum(1 for t in today_tracks if t.get('videoId') == track_id)
+        replay_count = detected_replays.get(track_id, 0) if detected_replays else 0
+        youtube_count = youtube_api_count + replay_count
+        if replay_count > 0:
+            logger.info(f"    └─ Replay adjustment: API count={youtube_api_count}, replays={replay_count}, total={youtube_count}")
 
         # Count how many times already scrobbled today in our history
         prefix = f"{track_id}_{scrobble_date}"
@@ -1130,6 +1260,9 @@ def main():
         logger.info(f"Cleaned up history: {len(scrobble_history)} → {len(cleaned_history)} entries")
     scrobble_history = cleaned_history
 
+    # Detect replays by comparing history position changes against previous snapshot
+    detected_replays = detect_replays(ytmusic_history, scrobble_history)
+
     # Extract 'Today' tracks from YouTube Music history
     today_tracks = extract_today_tracks(ytmusic_history)
 
@@ -1142,7 +1275,8 @@ def main():
         today_tracks,
         lastfm_recent_scrobbles,
         scrobble_history,
-        MAX_SCROBBLES_PER_RUN
+        MAX_SCROBBLES_PER_RUN,
+        detected_replays
     )
 
     if not tracks_to_scrobble:
@@ -1204,6 +1338,9 @@ def main():
         else:
             logger.error("❌ No tracks were successfully scrobbled")
             sys.exit(1)
+
+    # Save history snapshot for next run's replay detection
+    save_history_snapshot(ytmusic_history)
 
 
 if __name__ == "__main__":
