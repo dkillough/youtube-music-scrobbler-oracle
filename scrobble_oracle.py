@@ -66,6 +66,9 @@ HISTORY_FILE = CONFIG_DIR / "history.txt"  # Legacy single track ID file
 SCROBBLE_HISTORY_FILE = CONFIG_DIR / "scrobble_history.json"  # Comprehensive scrobble history
 ERROR_CREDS_FILE = CONFIG_DIR / "erroredcreds.json"
 HISTORY_SNAPSHOT_FILE = CONFIG_DIR / "history_snapshot.json"  # For replay detection between runs
+ROLLING_HISTORY_FILE = CONFIG_DIR / "history_rolling_log.json"  # Rolling log for robust replay detection
+ROLLING_HISTORY_MAX_SNAPSHOTS = 50
+ROLLING_HISTORY_MAX_AGE_HOURS = 24
 
 # Configuration constants
 TWO_WEEKS_SECONDS = 14 * 24 * 60 * 60  # 14 days in seconds
@@ -277,27 +280,71 @@ def save_history_snapshot(ytmusic_history: List[Dict]) -> None:
         logger.warning(f"Error saving history snapshot: {e}")
 
 
-def detect_replays(current_history: List[Dict], scrobble_history: Dict[str, Dict]) -> Dict[str, int]:
-    """
-    Compare current YouTube Music history order against previous snapshot.
-    Returns a dict of {videoId: replay_count} for tracks that were replayed between runs.
+def load_rolling_history() -> List[Dict]:
+    """Load the rolling history log. Falls back to seeding from single snapshot if rolling file doesn't exist."""
+    try:
+        if ROLLING_HISTORY_FILE.exists():
+            with open(ROLLING_HISTORY_FILE, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+                return data.get('snapshots', [])
+        # Seed from existing single snapshot if available
+        single = load_history_snapshot()
+        if single:
+            logger.info("Seeding rolling history from existing single snapshot")
+            return [single]
+        return []
+    except Exception as e:
+        logger.warning(f"Error loading rolling history: {e}")
+        return []
 
-    Detection methods:
-    - Track moved UP in position (closer to index 0) → 1 replay
-    - Track stayed at position 0 AND enough time since last scrobble → 1 back-to-back replay
-    """
-    previous_snapshot = load_history_snapshot()
-    if not previous_snapshot:
-        logger.info("No previous history snapshot found, cannot detect replays")
-        return {}
 
-    prev_order = previous_snapshot.get('history_order', [])
-    snapshot_timestamp = previous_snapshot.get('timestamp', 0)
+def save_rolling_snapshot(ytmusic_history: List[Dict]) -> None:
+    """Append a new snapshot to the rolling history log, prune old entries, and save single snapshot for compatibility."""
+    try:
+        rolling_log = load_rolling_history()
+
+        new_snapshot = {
+            "timestamp": int(time.time()),
+            "history_order": [t.get('videoId', '') for t in ytmusic_history if t.get('videoId')]
+        }
+        rolling_log.append(new_snapshot)
+
+        # Prune by count
+        if len(rolling_log) > ROLLING_HISTORY_MAX_SNAPSHOTS:
+            rolling_log = rolling_log[-ROLLING_HISTORY_MAX_SNAPSHOTS:]
+
+        # Prune by age
+        cutoff = int(time.time()) - (ROLLING_HISTORY_MAX_AGE_HOURS * 3600)
+        rolling_log = [s for s in rolling_log if s.get('timestamp', 0) >= cutoff]
+
+        with open(ROLLING_HISTORY_FILE, 'w', encoding='utf-8') as f:
+            json.dump({"snapshots": rolling_log}, f, indent=2)
+        logger.info(f"Saved rolling history snapshot ({len(rolling_log)} snapshots in log)")
+    except Exception as e:
+        logger.warning(f"Error saving rolling history: {e}")
+
+    # Also save single snapshot for backward compatibility
+    save_history_snapshot(ytmusic_history)
+
+
+def _compare_against_snapshot(
+    current_history: List[Dict],
+    snapshot: Dict,
+    scrobble_history: Dict[str, Dict],
+    skip_ids: set = None
+) -> Dict[str, int]:
+    """
+    Compare current history against a single snapshot.
+    Returns {videoId: replay_count} for tracks that moved up in position.
+    Skips any videoIds in skip_ids (already detected by a newer snapshot).
+    """
+    prev_order = snapshot.get('history_order', [])
+    snapshot_timestamp = snapshot.get('timestamp', 0)
 
     if not prev_order:
         return {}
 
-    # Build position lookup for previous snapshot
+    # Build position lookup for snapshot
     prev_positions = {}
     for i, vid_id in enumerate(prev_order):
         if vid_id not in prev_positions:  # Keep first (highest) position
@@ -310,27 +357,24 @@ def detect_replays(current_history: List[Dict], scrobble_history: Dict[str, Dict
         vid_id = track.get('videoId')
         if not vid_id:
             continue
+        if skip_ids and vid_id in skip_ids:
+            continue
 
         prev_pos = prev_positions.get(vid_id)
         if prev_pos is None:
-            # Track is new (not in previous snapshot) — not a replay
             continue
 
         if curr_pos < prev_pos:
-            # Track moved UP in the list — likely replayed
             artist = safe_get_artist_name(track)
             title = safe_get_title(track)
             logger.info(f"Replay detected: {artist} - {title} (position {prev_pos} -> {curr_pos})")
             replays[vid_id] = replays.get(vid_id, 0) + 1
         elif curr_pos == 0 and prev_pos == 0:
-            # Track stayed at position 0 — possible back-to-back replay
-            # Only count if enough time has passed since last scrobble
             duration = get_track_duration_seconds(track)
-            min_elapsed = duration * 2  # At least 2x track duration since snapshot
+            min_elapsed = duration * 2
 
             time_since_snapshot = current_time - snapshot_timestamp
             if time_since_snapshot >= min_elapsed:
-                # Verify against scrobble_history timestamps
                 scrobble_date = date.today().isoformat()
                 prefix = f"{vid_id}_{scrobble_date}"
                 last_scrobble_ts = 0
@@ -344,12 +388,45 @@ def detect_replays(current_history: List[Dict], scrobble_history: Dict[str, Dict
                     logger.info(f"Back-to-back replay detected: {artist} - {title} (stayed at position 0, {time_since_snapshot}s since snapshot)")
                     replays[vid_id] = replays.get(vid_id, 0) + 1
 
-    if replays:
-        logger.info(f"Detected {sum(replays.values())} replay(s) across {len(replays)} track(s)")
+    return replays
+
+
+def detect_replays(current_history: List[Dict], scrobble_history: Dict[str, Dict]) -> Dict[str, int]:
+    """
+    Compare current YouTube Music history order against rolling history snapshots.
+    Returns a dict of {videoId: replay_count} for tracks that were replayed between runs.
+
+    Uses the rolling history log for robustness across missed/failed runs.
+    Falls back to single snapshot if rolling log is empty.
+    """
+    rolling_log = load_rolling_history()
+
+    if not rolling_log:
+        logger.info("No history snapshots found (rolling or single), cannot detect replays")
+        return {}
+
+    # Compare against most recent snapshot first
+    all_replays = {}
+    latest = rolling_log[-1]
+    latest_replays = _compare_against_snapshot(current_history, latest, scrobble_history)
+    all_replays.update(latest_replays)
+
+    # Check older snapshots for tracks NOT detected via latest
+    # This catches replays that happened when runs were missed/failed
+    detected_ids = set(all_replays.keys())
+    for older_snapshot in reversed(rolling_log[:-1]):
+        additional = _compare_against_snapshot(current_history, older_snapshot, scrobble_history, skip_ids=detected_ids)
+        for vid_id, count in additional.items():
+            if vid_id not in all_replays:
+                all_replays[vid_id] = count
+                detected_ids.add(vid_id)
+
+    if all_replays:
+        logger.info(f"Detected {sum(all_replays.values())} replay(s) across {len(all_replays)} track(s)")
     else:
         logger.info("No replays detected from position analysis")
 
-    return replays
+    return all_replays
 
 
 def get_last_scrobbled():
@@ -463,24 +540,37 @@ def safe_get_album_name(track: Dict) -> str:
         return ""
 
 
-def clean_youtube_metadata(text: str, is_artist: bool = False) -> str:
+def clean_youtube_metadata(text: str, is_artist: bool = False, is_album: bool = False) -> str:
     """Clean YouTube Music specific metadata issues"""
     if not text:
         return ""
-    
+
     text = text.strip()
-    
-    # Remove YouTube-specific suffixes
+
+    # Remove YouTube-specific suffixes (universal — safe for both artist and title)
     youtube_suffixes = [
         r'\s*-\s*Topic$',
-        r'\s*VEVO$', 
-        r'\s*Records$',
-        r'\s*Music$',
-        r'\s*Official$',
+        r'\s*VEVO$',
     ]
-    
+
     for suffix in youtube_suffixes:
         text = re.sub(suffix, '', text, flags=re.IGNORECASE)
+
+    # Artist-only suffixes (not safe for titles — "This Music", "Gold Records" are real titles)
+    if is_artist:
+        artist_suffixes = [
+            r'\s*Records$',
+            r'\s*Official$',
+        ]
+        for suffix in artist_suffixes:
+            text = re.sub(suffix, '', text, flags=re.IGNORECASE)
+
+    # Album cleanup: only strip Explicit/Clean markers — preserve meaningful
+    # bracketed info like [Deluxe Edition], [Remastered], [Bonus Track Edition].
+    if is_album:
+        text = re.sub(r'\s*[\[\(](Explicit|Clean)[\]\)]\s*', ' ', text, flags=re.IGNORECASE)
+        text = re.sub(r'\s+', ' ', text)
+        return text.strip()
 
     # Clean up common YouTube title additions (for titles, not artists)
     if not is_artist:
@@ -536,19 +626,17 @@ def normalize_featuring_artists(text: str) -> str:
     if not text:
         return ""
 
-    # Comprehensive featuring variations - preserve surrounding whitespace
+    # Featuring variations — only unambiguous patterns
+    # Removed: \bwith\b, \bx\b, \band\b, & — too many false positives
+    # e.g. "piri & tommy" (real artist), "on & on" (real title), "Dance With Me", "The xx"
     featuring_patterns = [
         (r'\bfeaturing\b', 'feat.'),  # Exact word "featuring"
         (r'\bfeat\b(?!\.)', 'feat.'),  # "feat" without period (add period)
         (r'\bft\.', 'feat.'),          # "ft." with period
         (r'\bft\b(?!\.)', 'feat.'),    # "ft" without period
-        (r'\bwith\b', 'feat.'),        # "with" as exact word
-        (r'\bx\b', 'feat.'),           # "x" as exact word (common in hip-hop/rap)
         (r'\bversus\b', 'feat.'),      # "versus" as exact word
         (r'\bvs\.', 'feat.'),          # "vs." with period
         (r'\bvs\b(?!\.)', 'feat.'),    # "vs" without period
-        (r'\band\b', 'feat.'),         # "and" as exact word (only in featuring context)
-        (r'&', 'feat.'),               # "&" symbol (common in collaborations)
     ]
 
     # Replace all variations with consistent "feat." (preserving whitespace)
@@ -616,8 +704,8 @@ def clean_track_metadata(artist: str, title: str, album: str = "") -> tuple[str,
     """Clean and normalize track metadata for better matching"""
     # Clean each field
     cleaned_artist = clean_youtube_metadata(artist, is_artist=True)
-    cleaned_title = clean_youtube_metadata(title, is_artist=False) 
-    cleaned_album = clean_youtube_metadata(album, is_artist=False)
+    cleaned_title = clean_youtube_metadata(title, is_artist=False)
+    cleaned_album = clean_youtube_metadata(album, is_album=True)
     
     # Apply featuring normalization to both artist and title
     cleaned_artist = normalize_featuring_artists(cleaned_artist)
@@ -812,6 +900,7 @@ def scrobble_track(network, track, custom_timestamp: Optional[int] = None) -> bo
                 # Try to get album from the matched track, fallback to cleaned album
                 album_obj = best_track.get_album()
                 matched_album = album_obj.get_name() if album_obj else cleaned_album
+                matched_album = clean_youtube_metadata(matched_album, is_album=True)
             except Exception as e:
                 logger.warning(f"Error extracting track details from Last.fm match: {e}")
                 matched_artist = cleaned_artist
@@ -1339,8 +1428,8 @@ def main():
             logger.error("❌ No tracks were successfully scrobbled")
             sys.exit(1)
 
-    # Save history snapshot for next run's replay detection
-    save_history_snapshot(ytmusic_history)
+    # Save history snapshot for next run's replay detection (rolling + single for compat)
+    save_rolling_snapshot(ytmusic_history)
 
 
 if __name__ == "__main__":

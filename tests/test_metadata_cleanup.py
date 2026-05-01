@@ -10,24 +10,37 @@ from pathlib import Path
 sys.path.append(str(Path(__file__).parent.parent))
 
 
-def clean_youtube_metadata(text: str, is_artist: bool = False) -> str:
+def clean_youtube_metadata(text: str, is_artist: bool = False, is_album: bool = False) -> str:
     """Clean YouTube Music specific metadata issues"""
     if not text:
         return ""
-    
+
     text = text.strip()
-    
-    # Remove YouTube-specific suffixes
+
+    # Remove YouTube-specific suffixes (universal — safe for both artist and title)
     youtube_suffixes = [
         r'\s*-\s*Topic$',
-        r'\s*VEVO$', 
-        r'\s*Records$',
-        r'\s*Music$',
-        r'\s*Official$',
+        r'\s*VEVO$',
     ]
-    
+
     for suffix in youtube_suffixes:
         text = re.sub(suffix, '', text, flags=re.IGNORECASE)
+
+    # Artist-only suffixes (not safe for titles — "This Music", "Gold Records" are real titles)
+    if is_artist:
+        artist_suffixes = [
+            r'\s*Records$',
+            r'\s*Official$',
+        ]
+        for suffix in artist_suffixes:
+            text = re.sub(suffix, '', text, flags=re.IGNORECASE)
+
+    # Album cleanup: only strip Explicit/Clean markers — preserve meaningful
+    # bracketed info like [Deluxe Edition], [Remastered], [Bonus Track Edition].
+    if is_album:
+        text = re.sub(r'\s*[\[\(](Explicit|Clean)[\]\)]\s*', ' ', text, flags=re.IGNORECASE)
+        text = re.sub(r'\s+', ' ', text)
+        return text.strip()
 
     # Clean up common YouTube title additions (for titles, not artists)
     if not is_artist:
@@ -83,19 +96,15 @@ def normalize_featuring_artists(text: str) -> str:
     if not text:
         return ""
 
-    # Comprehensive featuring variations - preserve surrounding whitespace
+    # Featuring variations — only unambiguous patterns
     featuring_patterns = [
         (r'\bfeaturing\b', 'feat.'),  # Exact word "featuring"
         (r'\bfeat\b(?!\.)', 'feat.'),  # "feat" without period (add period)
         (r'\bft\.', 'feat.'),          # "ft." with period
         (r'\bft\b(?!\.)', 'feat.'),    # "ft" without period
-        (r'\bwith\b', 'feat.'),        # "with" as exact word
-        (r'\bx\b', 'feat.'),           # "x" as exact word (common in hip-hop/rap)
         (r'\bversus\b', 'feat.'),      # "versus" as exact word
         (r'\bvs\.', 'feat.'),          # "vs." with period
         (r'\bvs\b(?!\.)', 'feat.'),    # "vs" without period
-        (r'\band\b', 'feat.'),         # "and" as exact word (only in featuring context)
-        (r'&', 'feat.'),               # "&" symbol (common in collaborations)
     ]
 
     # Replace all variations with consistent "feat." (preserving whitespace)
@@ -127,8 +136,8 @@ def clean_track_metadata(artist: str, title: str, album: str = "") -> tuple:
     """Clean and normalize track metadata for better matching"""
     # Clean each field
     cleaned_artist = clean_youtube_metadata(artist, is_artist=True)
-    cleaned_title = clean_youtube_metadata(title, is_artist=False) 
-    cleaned_album = clean_youtube_metadata(album, is_artist=False)
+    cleaned_title = clean_youtube_metadata(title, is_artist=False)
+    cleaned_album = clean_youtube_metadata(album, is_album=True)
     
     # Apply featuring normalization to both artist and title
     cleaned_artist = normalize_featuring_artists(cleaned_artist)
@@ -155,8 +164,14 @@ def test_metadata_cleanup():
         # Featuring variations
         ("Post Malone feat. 21 Savage", "rockstar", "Post Malone feat. 21 Savage", "rockstar", "feat. normalization"),
         ("The Weeknd featuring Daft Punk", "Starboy", "The Weeknd feat. Daft Punk", "Starboy", "featuring normalization"),
-        ("Artist x Collaborator", "Song Title", "Artist feat. Collaborator", "Song Title", "x normalization"),
-        ("Artist & Other Artist", "Song", "Artist feat. Other Artist", "Song", "& normalization"),
+        ("Artist x Collaborator", "Song Title", "Artist x Collaborator", "Song Title", "x preserved (ambiguous)"),
+        ("Artist & Other Artist", "Song", "Artist & Other Artist", "Song", "& preserved (ambiguous)"),
+
+        # False-positive regression tests — real artists/titles that must NOT be mangled
+        ("piri & tommy", "on & on", "piri & tommy", "on & on", "Ampersand in real artist and title"),
+        ("underscores", "Music", "underscores", "Music", "Title is literally 'Music'"),
+        ("Starjunk 95", "This Music", "Starjunk 95", "This Music", "Title ending in Music"),
+        ("Simon and Garfunkel", "The Sound of Silence", "Simon and Garfunkel", "The Sound of Silence", "And in real artist name"),
 
         # Remix/Version handling
         ("DJ Snake", "Taki Taki (Original Mix)", "DJ Snake", "Taki Taki", "Original Mix removal"),
@@ -208,14 +223,46 @@ def test_metadata_cleanup():
             if result_title != expected_title:
                 print(f"   Title mismatch: got '{result_title}', expected '{expected_title}'")
     
+    # Album-specific tests: Explicit/Clean markers are stripped, other
+    # bracketed info (Deluxe Edition, Remastered, etc.) is preserved.
+    album_test_cases = [
+        ("Future Nostalgia [Explicit]", "Future Nostalgia", "Bracketed Explicit removal"),
+        ("Future Nostalgia [Clean]", "Future Nostalgia", "Bracketed Clean removal"),
+        ("Album (Explicit)", "Album", "Parenthesized Explicit removal"),
+        ("Album (Clean)", "Album", "Parenthesized Clean removal"),
+        ("Album [explicit]", "Album", "Case-insensitive Explicit removal"),
+        ("Renaissance [Deluxe Edition]", "Renaissance [Deluxe Edition]", "Deluxe Edition preserved"),
+        ("Abbey Road [Remastered]", "Abbey Road [Remastered]", "Remastered preserved"),
+        ("Album [Explicit] [Deluxe Edition]", "Album [Deluxe Edition]", "Strip Explicit, keep Deluxe"),
+        ("", "", "Empty album handling"),
+    ]
+
+    for i, (album, expected_album, description) in enumerate(album_test_cases, 1):
+        print(f"\n🔍 Album Test {i}: {description}")
+        print(f"Input:    Album: '{album}'")
+
+        _, _, result_album = clean_track_metadata("Artist", "Title", album)
+
+        print(f"Expected: Album: '{expected_album}'")
+        print(f"Result:   Album: '{result_album}'")
+
+        if result_album == expected_album:
+            print("✅ PASSED")
+            passed += 1
+        else:
+            print("❌ FAILED")
+            failed += 1
+            print(f"   Album mismatch: got '{result_album}', expected '{expected_album}'")
+
+    total = len(test_cases) + len(album_test_cases)
     print(f"\n{'='*100}")
-    print(f"📊 Test Results: {passed} passed, {failed} failed out of {len(test_cases)} total")
-    
+    print(f"📊 Test Results: {passed} passed, {failed} failed out of {total} total")
+
     if failed == 0:
         print("🎉 All tests passed! Metadata cleanup is working correctly.")
     else:
         print("⚠️  Some tests failed. Please review the implementation.")
-    
+
     return failed == 0
 
 
