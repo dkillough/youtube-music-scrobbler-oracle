@@ -28,7 +28,9 @@ if not CONFIG_DIR.exists():
     print(f"Creating config directory: {CONFIG_DIR}")
     CONFIG_DIR.mkdir(parents=True, exist_ok=True)
 
-# Load environment variables from .env file if it exists
+# Load environment variables from .env file if it exists.
+# Values already in the environment win, so one-off overrides (as passed by
+# recover_scrobbles.sh) are not clobbered by the on-disk defaults.
 env_file = SCRIPT_DIR / ".env"
 if env_file.exists():
     with open(env_file, 'r') as f:
@@ -36,7 +38,7 @@ if env_file.exists():
             line = line.strip()
             if line and not line.startswith('#') and '=' in line:
                 key, value = line.split('=', 1)
-                os.environ[key] = value
+                os.environ.setdefault(key, value)
 
 # Environment configuration
 LASTFM_API_KEY = os.environ.get('LASTFM_API_KEY')
@@ -65,6 +67,15 @@ BROWSER_CONFIG = CONFIG_DIR / "browser.json"
 HISTORY_FILE = CONFIG_DIR / "history.txt"  # Legacy single track ID file
 SCROBBLE_HISTORY_FILE = CONFIG_DIR / "scrobble_history.json"  # Comprehensive scrobble history
 ERROR_CREDS_FILE = CONFIG_DIR / "erroredcreds.json"
+CRED_FAILURE_FILE = CONFIG_DIR / "cred_failures.json"  # Consecutive-failure counter
+CRED_FAILURE_THRESHOLD = 4  # ~1 hour at the 15-minute cron interval
+
+# Errors that indicate a transient upstream problem, not bad credentials.
+TRANSIENT_ERROR_MARKERS = (
+    "500", "502", "503", "504", "429",
+    "Internal Server Error", "Bad Gateway", "Service Unavailable",
+    "Gateway Timeout", "Too Many Requests", "timed out", "Connection",
+)
 HISTORY_SNAPSHOT_FILE = CONFIG_DIR / "history_snapshot.json"  # For replay detection between runs
 ROLLING_HISTORY_FILE = CONFIG_DIR / "history_rolling_log.json"  # Rolling log for robust replay detection
 ROLLING_HISTORY_MAX_SNAPSHOTS = 50
@@ -74,15 +85,71 @@ ROLLING_HISTORY_MAX_AGE_HOURS = 24
 TWO_WEEKS_SECONDS = 14 * 24 * 60 * 60  # 14 days in seconds
 
 # Setup logging
+# Only mirror to stdout when a human is watching: a TTY, or an explicit dry run
+# (which is often piped). Under cron both are false, so the log is written once.
+_log_handlers = [logging.FileHandler(CONFIG_DIR / "scrobble.log")]
+if sys.stdout.isatty() or DRY_RUN:
+    _log_handlers.append(logging.StreamHandler(sys.stdout))
+
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(levelname)s - %(message)s',
-    handlers=[
-        logging.FileHandler(CONFIG_DIR / "scrobble.log"),
-        logging.StreamHandler(sys.stdout)
-    ]
+    handlers=_log_handlers
 )
 logger = logging.getLogger(__name__)
+
+
+def is_transient_error(error) -> bool:
+    """
+    True if the error looks like an upstream blip rather than an auth failure.
+    A 503 from Google must never cost us a working session.
+    """
+    text = str(error)
+    return any(marker in text for marker in TRANSIENT_ERROR_MARKERS)
+
+
+def _read_failure_count() -> int:
+    try:
+        return int(json.loads(CRED_FAILURE_FILE.read_text()).get("consecutive_failures", 0))
+    except Exception:
+        return 0
+
+
+def reset_credential_failures():
+    """Clear the failure counter after a successful call."""
+    if CRED_FAILURE_FILE.exists():
+        try:
+            CRED_FAILURE_FILE.unlink()
+        except OSError:
+            pass
+
+
+def note_credential_failure(error):
+    """
+    Record a failure, quarantining credentials only after enough consecutive
+    non-transient failures to be confident they are actually dead.
+    """
+    if is_transient_error(error):
+        logger.warning(f"Transient YouTube Music error, keeping credentials: {error}")
+        return
+
+    count = _read_failure_count() + 1
+    try:
+        CRED_FAILURE_FILE.write_text(json.dumps({"consecutive_failures": count}))
+    except OSError:
+        pass
+
+    if count < CRED_FAILURE_THRESHOLD:
+        logger.warning(
+            f"YouTube Music error {count}/{CRED_FAILURE_THRESHOLD}, keeping credentials: {error}"
+        )
+        return
+
+    if BROWSER_CONFIG.exists():
+        BROWSER_CONFIG.rename(ERROR_CREDS_FILE)
+        logger.error(
+            f"Quarantined credentials after {count} consecutive failures. Please run setup again."
+        )
 
 
 def login_to_ytmusic():
@@ -91,19 +158,16 @@ def login_to_ytmusic():
         if not BROWSER_CONFIG.exists():
             logger.error("Browser config file not found. Please run setup first.")
             return None
-            
+
         ytmusic = YTMusic(str(BROWSER_CONFIG))
         logger.info("Successfully logged into YouTube Music")
         return ytmusic
-        
+
     except ytmusicapi.exceptions.YTMusicServerError as e:
         logger.warning(f"YouTube Music server error: {e}")
-        # Mark credentials as errored
-        if BROWSER_CONFIG.exists():
-            BROWSER_CONFIG.rename(ERROR_CREDS_FILE)
-        logger.error("Credentials may have expired. Please run setup again.")
+        note_credential_failure(e)
         return None
-        
+
     except Exception as e:
         logger.error(f"Failed to login to YouTube Music: {e}")
         return None
@@ -113,6 +177,7 @@ def get_listening_history(ytmusic):
     """Get the current listening history from YouTube Music"""
     try:
         history = ytmusic.get_history()
+        reset_credential_failures()
         if history:
             logger.info(f"Retrieved {len(history)} tracks from history")
             return history
@@ -122,9 +187,7 @@ def get_listening_history(ytmusic):
 
     except ytmusicapi.exceptions.YTMusicServerError as e:
         logger.error(f"Failed to get history: {e}")
-        # Mark credentials as errored
-        if BROWSER_CONFIG.exists():
-            BROWSER_CONFIG.rename(ERROR_CREDS_FILE)
+        note_credential_failure(e)
         return None
 
     except Exception as e:
